@@ -13,14 +13,14 @@ That 5% is real, but unlevered it is below the hackathon's 10% APY eligibility f
 
 ## How it works
 
-1. User deposits USDX into the Ranger vault.
-2. Keeper wraps USDX → mUSDX (1:1 at the current exchange rate; no slippage).
-3. Keeper deposits mUSDX into Save as collateral.
-4. Keeper borrows USDC against it — up to the LTV that keeps health factor ≥ 1.05.
-5. Keeper swaps USDC → USDX via Jupiter (adaptor enforces a min-out floor; keeper picks the route).
+1. User deposits **USDC** into the Ranger vault.
+2. Keeper swaps USDC → USDX via Jupiter (adaptor enforces a min-out floor).
+3. Keeper wraps USDX → mUSDX (1:1 at the current exchange rate; no slippage).
+4. Keeper deposits mUSDX into Save as collateral.
+5. Keeper borrows USDC against it — up to the LTV that keeps health factor ≥ 1.05.
 6. Back to step 2; repeat until target leverage is hit (4x default, 5x cap, 10x hardcoded ceiling).
 
-Unwind runs in reverse. The user's principal is protected by the 10-day effective withdrawal window: 7-day mUSDX cooldown plus a buffer that lets the keeper unwind positions without fire-saling collateral.
+Unwind runs in reverse and terminates in USDC: the keeper pulls mUSDX out of Save, swaps back through USDX → USDC, repays the USDC debt, and returns **USDC** to the user. The user's principal is protected by the 10-day effective withdrawal window: 7-day mUSDX cooldown plus a buffer that lets the keeper unwind positions without fire-saling collateral.
 
 ## Yield math
 
@@ -74,7 +74,7 @@ The keeper rebalances when any of the following trigger:
 
 ### Eligibility notes
 
-- **Base asset.** The hackathon prize rules specify USDC as the vault base asset. This submission accepts **USDX** — we've designed around the user experience of a USDX-native product, since USDX is what Stable's users already hold. A straightforward wrapper script that swaps USDC → USDX at the vault boundary is a one-line addition if the organizers require strict USDC base.
+- **Base asset.** The vault accepts **USDC** and returns **USDC** — matching the hackathon prize rule that USDC is the vault base asset. USDX/mUSDX are internal implementation details of the strategy loop; the LP never has to hold them.
 - **Yield source.** USDX yield comes from off-chain mortgage interest, not from another yield-bearing stablecoin. There is no circular dependency. It is not a junior tranche, not an insurance pool, not a DEX LP position.
 - **Leverage.** Health-factor floor of 1.05 matches the rule text; the mUSDX/USDX price is not hardcoded in the oracle but the wrap rate is enforced by the mUSDX program itself (not a market feed), so the leverage-pricing risk the rule targets does not apply.
 
@@ -87,7 +87,7 @@ The keeper rebalances when any of the following trigger:
 
 ## What we'd do post-hackathon
 
-1. Add a USDC-native entrypoint that swaps USDC → USDX at deposit and reverses at withdraw.
-2. Add a secondary collateral venue (Kamino) to diversify liquidation risk away from a single lending pool.
-3. Publish a public dashboard of real-time leverage, HF, and realized APY.
-4. Raise target leverage cautiously once we have >30 days of live data on Save mUSDX reserve stability.
+1. Add a secondary collateral venue (Kamino) to diversify liquidation risk away from a single lending pool.
+2. Publish a public dashboard of real-time leverage, HF, and realized APY.
+3. Raise target leverage cautiously once we have >30 days of live data on Save mUSDX reserve stability.
+4. Expose a direct USDX-in / USDX-out entry for users who already hold USDX natively, alongside the default USDC path.

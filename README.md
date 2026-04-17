@@ -10,10 +10,13 @@ Built by [Stable](https://trystable.co) for the [Ranger Build-a-Bear Hackathon](
 
 ## What it does
 
-Users deposit **USDX** into the Ranger vault. A keeper wraps USDX to mUSDX and runs a leveraged loop through Save Finance to amplify the ~5% base yield from USDX's mortgage backing:
+Users deposit **USDC** into the Ranger vault and receive **USDC** back on withdrawal. Under the hood, the keeper swaps USDC to USDX, wraps USDX to mUSDX, and runs a leveraged loop through Save Finance to amplify the ~5% base yield from USDX's mortgage backing:
 
 ```
-User deposits USDX
+User deposits USDC
+        |
+        v
+Jupiter swap USDC -> USDX
         |
         v
 Keeper wraps USDX -> mUSDX
@@ -22,35 +25,35 @@ Keeper wraps USDX -> mUSDX
 Posts mUSDX as Save collateral
         |
         v
-Borrows USDC against it
+Borrows USDC against it         <-- repeat until target leverage (4x default)
         |
         v
 Jupiter swap USDC -> USDX
         |
         v
-Wrap USDX -> mUSDX              <-- repeat until target leverage (4x default)
+Wrap USDX -> mUSDX
         |
         v
 Post more mUSDX as collateral
 ```
 
-At 4x leverage on 5% base yield: **~11–13% net APY** on USDX deposits.
+On withdrawal the loop runs in reverse — mUSDX unwinds to USDX, then to USDC — so the LP holds only USDC. At 4x leverage on 5% base yield: **~11–13% net APY** on USDC deposits.
 
 ## Architecture
 
 ```
           User
             |
-            |  deposit USDX
+            |  deposit USDC  (withdraw USDC)
             v
    +-----------------+
-   |  Ranger Vault   |  2udsDEMJzSpcJiGqULC29C9wJufoerY5SAwmUYTMHNFr
+   |  Ranger Vault   |  CpLxaSioYMjJscmX4gH13iAkrxrMLJTH1PXYQMMeuKB5
    |   (Voltr SDK)   |
    +--------+--------+
             |  CPI
             v
    +-----------------+
-   | lev_musdx_      |  5k9CgNiSXSRbLG6PaSSJwkriYkg8i9hdyc8gkDBj3jyv
+   | lev_musdx_      |  Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr
    | adaptor         |   (first multi-protocol looping adaptor on Ranger)
    +--------+--------+
           / | \
@@ -65,7 +68,7 @@ At 4x leverage on 5% base yield: **~11–13% net APY** on USDX deposits.
 | Program | Address | Description |
 |---------|---------|-------------|
 | mUSDX | `5NTrBzBD92B8qRDquvxBihpcxQHmCNqu2WtmoT9RRFpK` | USDX Savings — non-rebasing yield wrapper |
-| lev_musdx_adaptor | `5k9CgNiSXSRbLG6PaSSJwkriYkg8i9hdyc8gkDBj3jyv` | Ranger/Voltr adaptor running the leveraged loop |
+| lev_musdx_adaptor | `Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr` | Ranger/Voltr adaptor running the leveraged loop |
 
 ### Tokens
 
@@ -78,7 +81,7 @@ At 4x leverage on 5% base yield: **~11–13% net APY** on USDX deposits.
 
 | Component | Address | Purpose |
 |-----------|---------|---------|
-| Ranger Vault | `2udsDEMJzSpcJiGqULC29C9wJufoerY5SAwmUYTMHNFr` | Accepts USDX deposits, routes into the adaptor |
+| Ranger Vault | `CpLxaSioYMjJscmX4gH13iAkrxrMLJTH1PXYQMMeuKB5` | Accepts USDC deposits, routes into the adaptor |
 | Save Lending Pool | `7JoeENZjr1zGuocJ3d8eHxPzs6xSZKNwxQycHeRDiDCf` | mUSDX collateral + USDC borrow |
 | Orca Pool (mUSDX/USDX) | `FVxyfzzoPb6krQbefLZtBAcXLJwUfvaX8ypqsHQPso2o` | Instant mUSDX exit at spread |
 | Switchboard feed (mUSDX/USDX) | `DcXQmwQ1bz177STVkLqubbb5ohjTVnJzMB2PTQkWvbmQ` | Oracle for Save reserve pricing |
@@ -149,10 +152,9 @@ Source: [`programs/lev_musdx_adaptor/src/`](./programs/lev_musdx_adaptor/src).
 
 ## Withdrawals
 
-Users can exit two ways:
+Users withdraw in **USDC**. The keeper unwinds leverage (mUSDX → USDX → USDC), repays Save debt, and returns USDC to the LP. Effective wait ≈ **10 days** (7-day mUSDX cooldown + unwind buffer). USDX/mUSDX never touches the user's wallet.
 
-1. **Vault redemption** (principal + yield) — the keeper unwinds leverage, then the 7-day mUSDX cooldown resolves. Effective wait ≈ **10 days** (7-day cooldown + unwind buffer).
-2. **Instant** via the [Orca mUSDX/USDX pool](https://www.orca.so/pools/FVxyfzzoPb6krQbefLZtBAcXLJwUfvaX8ypqsHQPso2o) — pay the spread, skip the wait.
+Power users who already hold mUSDX can also exit instantly via the [Orca mUSDX/USDX pool](https://www.orca.so/pools/FVxyfzzoPb6krQbefLZtBAcXLJwUfvaX8ypqsHQPso2o) at spread — but that path is outside the vault's USDC-in/USDC-out interface.
 
 ## Yield Math
 
