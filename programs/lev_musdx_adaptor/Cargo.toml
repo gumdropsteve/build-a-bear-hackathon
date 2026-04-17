@@ -1,0 +1,22 @@
+[package]
+name = "lev_musdx_adaptor"
+version = "0.1.0"
+description = "Voltr/Ranger adaptor that executes a levered mUSDX loop through Save Finance"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "lev_musdx_adaptor"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.0", features = ["init-if-needed"] }
+anchor-spl = "0.31.0"
+musdx = { path = "../musdx", features = ["cpi"] }

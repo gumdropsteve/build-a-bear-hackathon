@@ -1,0 +1,32 @@
+{
+  "name": "bears-levered-susdx",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "lint:fix": "prettier \"scripts/**/*.ts\" \"tests/**/*.ts\" -w",
+    "lint": "prettier \"scripts/**/*.ts\" \"tests/**/*.ts\" --check"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.0",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.0",
+    "@supabase/supabase-js": "^2.103.3",
+    "@types/express": "^5.0.6",
+    "@voltr/vault-sdk": "latest",
+    "bn.js": "^5.2.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.16",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.12.0",
+    "chai": "^4.3.10",
+    "mocha": "^10.4.0",
+    "prettier": "^3.2.5",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.4.5"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "Staked USDX",
+  "symbol": "mUSDX",
+  "description": "mUSDX is the yield-bearing form of USDX, the mortgage-backed stablecoin",
+  "image": "https://gist.githubusercontent.com/gumdropsteve/d3ef3a9e8fa94a2bee277602d952f204/raw/musdx-icon.svg",
+  "external_url": "https://trystable.co",
+  "attributes": [
+    {
+      "trait_type": "Type",
+      "value": "Yield-Bearing Stablecoin"
+    },
+    {
+      "trait_type": "Underlying",
+      "value": "USDX"
+    },
+    {
+      "trait_type": "Chain",
+      "value": "Solana"
+    }
+  ],
+  "properties": {
+    "files": [],
+    "category": "image",
+    "links": {
+      "website": "https://trystable.co"
+    }
+  }
+}
