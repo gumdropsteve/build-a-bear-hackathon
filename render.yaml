@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: musdx-vault-keeper
+    runtime: node
+    buildCommand: npm install && npx tsc --skipLibCheck --esModuleInterop --resolveJsonModule --module commonjs --target es2020 --outDir dist keeper/index.ts
+    startCommand: node dist/keeper/index.js server
+    healthCheckPath: /health
+    envVars:
+      - key: USDX_LOOP_VAULT_ALCHEMY_RPC_API_KEY
+        sync: false
+      - key: KEEPER_KEYPAIR_PATH
+        sync: false
+      - key: STABLE_AGENTS_SUPABASE_PROJECT_ID
+        sync: false
+      - key: STABLE_AGENTS_SUPABASE_SERVICE_ROLE
+        sync: false
+      - key: PORT
+        value: 3000

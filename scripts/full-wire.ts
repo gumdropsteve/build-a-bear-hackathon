@@ -1,0 +1,168 @@
+/**
+ * full-wire.ts — Complete wiring: add adaptor, init config, register with Voltr,
+ * create obligation, create ATAs. All in one script.
+ */
+import {
+  Connection, Keypair, PublicKey, SystemProgram, Transaction,
+  TransactionInstruction, sendAndConfirmTransaction,
+  SYSVAR_RENT_PUBKEY,
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+} from "@solana/spl-token";
+import { VoltrClient } from "@voltr/vault-sdk";
+import { createHash } from "crypto";
+import * as fs from "fs";
+import * as os from "os";
+
+const ADAPTOR = new PublicKey("5k9CgNiSXSRbLG6PaSSJwkriYkg8i9hdyc8gkDBj3jyv");
+const VAULT = new PublicKey("2udsDEMJzSpcJiGqULC29C9wJufoerY5SAwmUYTMHNFr");
+const SAVE_PROGRAM = new PublicKey("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
+const LENDING_MARKET = new PublicKey("7JoeENZjr1zGuocJ3d8eHxPzs6xSZKNwxQycHeRDiDCf");
+const USDX_MINT = new PublicKey("9Gst2E7KovZ9jwecyGqnnhpG1mhHKdyLpJQnZonkCFhA");
+const MUSDX_MINT = new PublicKey("3RyhjAivYTA1VyXJUG1qXgCLHq4zBvbD9B6bcrcDnKB9");
+const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const MUSDX_COLLATERAL_MINT = new PublicKey("Guftqij3rRD9U2Q3LRwxzDYXzq6J4fy1bwY5fqvQzc4p");
+
+const CONFIG_SEED = Buffer.from("strategy_config");
+
+function disc(name: string): Buffer {
+  return createHash("sha256").update(`global:${name}`).digest().slice(0, 8);
+}
+
+function loadKeypair(p: string): Keypair {
+  return Keypair.fromSecretKey(
+    Uint8Array.from(JSON.parse(fs.readFileSync(p.replace("~", os.homedir()), "utf-8")))
+  );
+}
+
+async function main() {
+  const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+  const payer = loadKeypair("~/.config/solana/id.json");
+  const vc = new VoltrClient(connection);
+
+  const [configPda] = PublicKey.findProgramAddressSync(
+    [CONFIG_SEED, VAULT.toBuffer()], ADAPTOR
+  );
+
+  console.log("Payer:", payer.publicKey.toBase58());
+  console.log("Adaptor:", ADAPTOR.toBase58());
+  console.log("Config PDA:", configPda.toBase58());
+  console.log();
+
+  // 1. Add adaptor to vault
+  console.log("1. Adding adaptor to vault...");
+  const addIx = await vc.createAddAdaptorIx({
+    vault: VAULT, payer: payer.publicKey, admin: payer.publicKey,
+    adaptorProgram: ADAPTOR,
+  });
+  let sig = await sendAndConfirmTransaction(connection, new Transaction().add(addIx), [payer]);
+  console.log("  tx:", sig);
+
+  // 2. Create config PDA via initialize_config
+  console.log("\n2. Creating config PDA...");
+  {
+    const fakeObligation = new PublicKey("11111111111111111111111111111111");
+    const args = Buffer.concat([
+      VAULT.toBuffer(),
+      fakeObligation.toBuffer(),
+      Buffer.from([0x90, 0x01]), // target 400
+      Buffer.from([0xF4, 0x01]), // max 500
+      Buffer.from([0x64, 0x00]), // slip 100
+      Buffer.from([8]),          // cap 8
+    ]);
+    const ix = new TransactionInstruction({
+      programId: ADAPTOR,
+      keys: [
+        { pubkey: configPda, isSigner: false, isWritable: true },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.concat([disc("initialize_config"), args]),
+    });
+    sig = await sendAndConfirmTransaction(connection, new Transaction().add(ix), [payer]);
+    console.log("  tx:", sig);
+  }
+
+  // 3. Register strategy with Voltr
+  console.log("\n3. Registering with Voltr...");
+  {
+    const initStrategyIx = await vc.createInitializeStrategyIx(
+      { instructionDiscriminator: null, additionalArgs: VAULT.toBuffer() },
+      {
+        payer: payer.publicKey, manager: payer.publicKey, vault: VAULT,
+        strategy: configPda, adaptorProgram: ADAPTOR, remainingAccounts: [],
+      }
+    );
+    sig = await sendAndConfirmTransaction(connection, new Transaction().add(initStrategyIx), [payer]);
+    console.log("  tx:", sig);
+
+    const { strategyInitReceipt } = vc.findVaultStrategyAddresses(VAULT, configPda);
+    const receipt = await vc.fetchStrategyInitReceiptAccount(strategyInitReceipt);
+    console.log("  strategy:", receipt.strategy.toBase58());
+    console.log("  positionValue:", receipt.positionValue.toString());
+  }
+
+  // 4. Create strategy ATAs
+  console.log("\n4. Creating strategy ATAs...");
+  {
+    const atas = [
+      createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
+        getAssociatedTokenAddressSync(USDX_MINT, configPda, true), configPda, USDX_MINT),
+      createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
+        getAssociatedTokenAddressSync(MUSDX_MINT, configPda, true), configPda, MUSDX_MINT),
+      createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
+        getAssociatedTokenAddressSync(USDC_MINT, configPda, true), configPda, USDC_MINT),
+    ];
+    sig = await sendAndConfirmTransaction(connection, new Transaction().add(...atas), [payer]);
+    console.log("  tx:", sig);
+
+    sig = await sendAndConfirmTransaction(connection, new Transaction().add(
+      createAssociatedTokenAccountIdempotentInstruction(payer.publicKey,
+        getAssociatedTokenAddressSync(MUSDX_COLLATERAL_MINT, configPda, true), configPda, MUSDX_COLLATERAL_MINT),
+    ), [payer]);
+    console.log("  tx:", sig);
+  }
+
+  // 5. Create Save obligation
+  console.log("\n5. Creating Save obligation...");
+  {
+    const marketStr = LENDING_MARKET.toBase58();
+    const seed = marketStr.slice(0, 32);
+    const obligationPubkey = await PublicKey.createWithSeed(configPda, seed, SAVE_PROGRAM);
+    console.log("  Obligation:", obligationPubkey.toBase58());
+
+    const ix = new TransactionInstruction({
+      programId: ADAPTOR,
+      keys: [
+        { pubkey: configPda, isSigner: false, isWritable: true },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: false }, // admin
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },  // payer
+        { pubkey: SAVE_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: obligationPubkey, isSigner: false, isWritable: true },
+        { pubkey: LENDING_MARKET, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      data: disc("init_save_obligation"),
+    });
+    sig = await sendAndConfirmTransaction(connection, new Transaction().add(ix), [payer]);
+    console.log("  tx:", sig);
+  }
+
+  console.log("\n========================================");
+  console.log("  FULLY WIRED ON MAINNET");
+  console.log("  Adaptor:", ADAPTOR.toBase58());
+  console.log("  Config PDA:", configPda.toBase58());
+  console.log("  Vault:", VAULT.toBase58());
+  console.log("========================================");
+}
+
+main().catch((err) => {
+  console.error("\nFAILED:", err.message || err);
+  console.error(err.transactionLogs || "");
+  process.exit(1);
+});
