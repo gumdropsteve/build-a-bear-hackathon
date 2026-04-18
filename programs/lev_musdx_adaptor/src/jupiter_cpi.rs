@@ -24,8 +24,14 @@ use anchor_lang::solana_program::{
 pub const JUPITER_V6_PROGRAM_ID: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
 
 /// Forward a pre-built Jupiter swap instruction via CPI.
+///
+/// Jupiter's swap instruction requires the user_transfer_authority (our
+/// config PDA) to be marked is_signer in the inner AccountMeta. The outer
+/// transaction can't mark a PDA as signer (PDAs have no keypair), so we
+/// override the bit here; `invoke_signed` authorizes via seeds.
 pub fn invoke_jupiter_swap<'info>(
     jupiter_program: &AccountInfo<'info>,
+    signer_pda: &Pubkey,
     route_accounts: &[AccountInfo<'info>],
     instruction_data: Vec<u8>,
     signer_seeds: &[&[&[u8]]],
@@ -33,10 +39,11 @@ pub fn invoke_jupiter_swap<'info>(
     let account_metas: Vec<AccountMeta> = route_accounts
         .iter()
         .map(|acc| {
+            let is_signer = acc.is_signer || acc.key == signer_pda;
             if acc.is_writable {
-                AccountMeta::new(*acc.key, acc.is_signer)
+                AccountMeta::new(*acc.key, is_signer)
             } else {
-                AccountMeta::new_readonly(*acc.key, acc.is_signer)
+                AccountMeta::new_readonly(*acc.key, is_signer)
             }
         })
         .collect();

@@ -16,7 +16,7 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 mod jupiter_cpi;
 mod save_cpi;
 
-declare_id!("5k9CgNiSXSRbLG6PaSSJwkriYkg8i9hdyc8gkDBj3jyv");
+declare_id!("Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr");
 
 pub const CONFIG_SEED: &[u8] = b"strategy_config";
 
@@ -25,6 +25,40 @@ pub const ABSOLUTE_MAX_SLIPPAGE_BPS: u16 = 500; // 5%
 
 /// 48-hour timelock for admin rotation (L-1 audit remediation).
 pub const ADMIN_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
+
+/// Save Obligation struct offsets for deposits_len / borrows_len, per the
+/// Save fork's packed layout (see save-token-lending/.../state/obligation.rs).
+const OBLIGATION_DEPOSITS_LEN_OFFSET: usize = 202;
+const OBLIGATION_BORROWS_LEN_OFFSET: usize = 203;
+
+/// Build the extra-reserves list for Save's refresh_obligation so it exactly
+/// matches the obligation's on-chain deposits then borrows arrays. Save
+/// iterates both arrays and reads one AccountInfo per entry; the first open
+/// leverage step runs against an obligation with borrows_len=0, so we only
+/// pass mUSDX. Mismatches trigger "too many reserves" or "collateral N not
+/// owned" errors depending on what we pass.
+fn build_refresh_obligation_reserves<'info>(
+    obligation: &AccountInfo<'info>,
+    musdx_reserve: &AccountInfo<'info>,
+    usdc_reserve: &AccountInfo<'info>,
+) -> Result<Vec<AccountInfo<'info>>> {
+    let data = obligation.try_borrow_data()?;
+    require!(
+        data.len() > OBLIGATION_BORROWS_LEN_OFFSET,
+        LevMusdxError::InvalidObligation
+    );
+    let deposits_len = data[OBLIGATION_DEPOSITS_LEN_OFFSET];
+    let borrows_len = data[OBLIGATION_BORROWS_LEN_OFFSET];
+    drop(data);
+
+    require!(deposits_len <= 1, LevMusdxError::InvalidObligation);
+    require!(borrows_len <= 1, LevMusdxError::InvalidObligation);
+
+    let mut reserves = Vec::with_capacity(2);
+    if deposits_len == 1 { reserves.push(musdx_reserve.clone()); }
+    if borrows_len == 1 { reserves.push(usdc_reserve.clone()); }
+    Ok(reserves)
+}
 
 // ---------------------------------------------------------------------------
 // Program
@@ -303,24 +337,62 @@ pub mod lev_musdx_adaptor {
         Ok(())
     }
 
-    /// Deposit USDX at 1x — wrap to mUSDX and post as Save collateral.
+    /// Deposit USDC at 1x — swap to USDX via Jupiter, wrap to mUSDX, and post as
+    /// Save collateral. The entry asset is USDC so the strategy's native face is
+    /// USDC, matching the hackathon requirement. Jupiter route accounts are
+    /// supplied via `remaining_accounts`.
     pub fn deposit_collateral<'info>(
         ctx: Context<'_, '_, 'info, 'info, DepositCollateral<'info>>,
-        usdx_amount: u64,
+        usdc_amount: u64,
+        jupiter_data: Vec<u8>,
     ) -> Result<()> {
         let config = &ctx.accounts.config;
         require!(!config.paused, LevMusdxError::Paused);
-        require!(usdx_amount > 0, LevMusdxError::ZeroAmount);
+        require!(usdc_amount > 0, LevMusdxError::ZeroAmount);
 
         let voltr_vault = config.voltr_vault;
         let bump = config.bump;
+        let min_swap_price_bps = config.min_swap_price_bps;
         let signer_seeds: &[&[&[u8]]] =
             &[&[CONFIG_SEED, voltr_vault.as_ref(), &[bump]]];
 
-        // Snapshot mUSDX balance before wrap
+        // ---- 1. Swap USDC -> USDX via Jupiter ----
+        let usdx_before = ctx.accounts.strategy_usdx_ata.amount;
+
+        let route_accounts: Vec<AccountInfo<'info>> = ctx
+            .remaining_accounts
+            .to_vec();
+
+        jupiter_cpi::invoke_jupiter_swap(
+            &ctx.accounts.jupiter_program,
+            &ctx.accounts.config.key(),
+            &route_accounts,
+            jupiter_data,
+            signer_seeds,
+        )?;
+
+        ctx.accounts.strategy_usdx_ata.reload()?;
+        let usdx_received = ctx
+            .accounts
+            .strategy_usdx_ata
+            .amount
+            .checked_sub(usdx_before)
+            .ok_or(LevMusdxError::MathOverflow)?;
+        require!(usdx_received > 0, LevMusdxError::SwapFailed);
+
+        // Enforce minimum swap price floor (shared with open_leverage_step):
+        //   usdx_received / usdc_amount >= min_swap_price_bps / 10_000
+        let lhs = (usdx_received as u128)
+            .checked_mul(10_000)
+            .ok_or(LevMusdxError::MathOverflow)?;
+        let rhs = (usdc_amount as u128)
+            .checked_mul(min_swap_price_bps as u128)
+            .ok_or(LevMusdxError::MathOverflow)?;
+        require!(lhs >= rhs, LevMusdxError::SwapPriceBelowFloor);
+
+        // ---- 2. Wrap USDX -> mUSDX ----
         let musdx_before = ctx.accounts.strategy_musdx_ata.amount;
 
-        // Wrap USDX -> mUSDX via CPI to the mUSDX program
         {
             let cpi_program = ctx.accounts.musdx_program.to_account_info();
             let cpi_accounts = musdx::cpi::accounts::Wrap {
@@ -335,7 +407,7 @@ pub mod lev_musdx_adaptor {
             };
             musdx::cpi::wrap(
                 CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
-                usdx_amount,
+                usdx_received,
             )?;
         }
 
@@ -393,7 +465,8 @@ pub mod lev_musdx_adaptor {
         config.last_refresh_ts = Clock::get()?.unix_timestamp;
 
         emit!(DepositCollateralEvent {
-            usdx_deposited: usdx_amount,
+            usdc_deposited: usdc_amount,
+            usdx_received,
             musdx_collateral_added: musdx_received,
             total_musdx_collateral: config.musdx_collateral_amount,
         });
@@ -444,15 +517,20 @@ pub mod lev_musdx_adaptor {
             signer_seeds,
         )?;
 
-        // Refresh obligation (with both reserve accounts)
+        // Refresh obligation. The list of extra reserves must match the
+        // obligation's on-chain deposits then borrows — on the very first
+        // open_leverage_step (before any USDC has been borrowed) the borrows
+        // array is empty, so we must only pass mUSDX. Mismatches trigger
+        // Save's "Too many..." check at the tail of refresh_obligation.
+        let extra_reserves = build_refresh_obligation_reserves(
+            &ctx.accounts.save_obligation,
+            &ctx.accounts.musdx_reserve,
+            &ctx.accounts.usdc_reserve,
+        )?;
         save_cpi::refresh_obligation(
             &ctx.accounts.save_program,
             &ctx.accounts.save_obligation,
-            &ctx.accounts.clock,
-            &[
-                ctx.accounts.musdx_reserve.to_account_info(),
-                ctx.accounts.usdc_reserve.to_account_info(),
-            ],
+            &extra_reserves,
             signer_seeds,
         )?;
 
@@ -467,8 +545,9 @@ pub mod lev_musdx_adaptor {
             &ctx.accounts.save_lending_market,
             &ctx.accounts.save_lending_market_authority,
             &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.clock,
             &ctx.accounts.token_program.to_account_info(),
+            // Save's fork requires obligation.deposits reserves appended here.
+            &[ctx.accounts.musdx_reserve.to_account_info()],
             None, // no host fee receiver
             usdc_borrow_amount,
             signer_seeds,
@@ -484,6 +563,7 @@ pub mod lev_musdx_adaptor {
 
         jupiter_cpi::invoke_jupiter_swap(
             &ctx.accounts.jupiter_program,
+            &ctx.accounts.config.key(),
             &route_accounts,
             jupiter_data,
             signer_seeds,
@@ -649,14 +729,15 @@ pub mod lev_musdx_adaptor {
             signer_seeds,
         )?;
 
+        let extra_reserves = build_refresh_obligation_reserves(
+            &ctx.accounts.save_obligation,
+            &ctx.accounts.musdx_reserve,
+            &ctx.accounts.usdc_reserve,
+        )?;
         save_cpi::refresh_obligation(
             &ctx.accounts.save_program,
             &ctx.accounts.save_obligation,
-            &ctx.accounts.clock,
-            &[
-                ctx.accounts.musdx_reserve.to_account_info(),
-                ctx.accounts.usdc_reserve.to_account_info(),
-            ],
+            &extra_reserves,
             signer_seeds,
         )?;
 
@@ -674,8 +755,9 @@ pub mod lev_musdx_adaptor {
             &ctx.accounts.musdx_reserve_liquidity_supply,
             &ctx.accounts.config.to_account_info(),
             &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.clock,
             &ctx.accounts.token_program.to_account_info(),
+            // Save's fork requires obligation.deposits reserves appended here.
+            &[ctx.accounts.musdx_reserve.to_account_info()],
             collateral_withdraw_amount,
             signer_seeds,
         )?;
@@ -690,6 +772,7 @@ pub mod lev_musdx_adaptor {
 
         jupiter_cpi::invoke_jupiter_swap(
             &ctx.accounts.jupiter_program,
+            &ctx.accounts.config.key(),
             &route_accounts,
             jupiter_data,
             signer_seeds,
@@ -725,7 +808,6 @@ pub mod lev_musdx_adaptor {
             &ctx.accounts.save_obligation,
             &ctx.accounts.save_lending_market,
             &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.clock,
             &ctx.accounts.token_program.to_account_info(),
             repay_amount,
             signer_seeds,
@@ -767,13 +849,16 @@ pub mod lev_musdx_adaptor {
     }
 
     /// Withdraw idle USDX from the strategy back to Voltr vault ATA.
+    /// Sweep idle USDC out of the strategy back to the Voltr vault's idle ATA.
+    /// Called by the admin after running enough `close_leverage_step`s to
+    /// accumulate the desired USDC in `strategy_usdc_ata`.
     pub fn withdraw_collateral<'info>(
         ctx: Context<'_, '_, 'info, 'info, WithdrawCollateral<'info>>,
-        usdx_amount: u64,
+        usdc_amount: u64,
     ) -> Result<()> {
         let config = &ctx.accounts.config;
         require!(!config.paused, LevMusdxError::Paused);
-        require!(usdx_amount > 0, LevMusdxError::ZeroAmount);
+        require!(usdc_amount > 0, LevMusdxError::ZeroAmount);
         require_keys_eq!(
             ctx.accounts.admin.key(),
             config.admin,
@@ -785,25 +870,25 @@ pub mod lev_musdx_adaptor {
         let signer_seeds: &[&[&[u8]]] =
             &[&[CONFIG_SEED, voltr_vault.as_ref(), &[bump]]];
 
-        // Transfer USDX from strategy ATA back to vault ATA
+        // Transfer USDC from strategy ATA back to vault idle ATA
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.strategy_usdx_ata.to_account_info(),
-                    to: ctx.accounts.vault_usdx_ata.to_account_info(),
+                    from: ctx.accounts.strategy_usdc_ata.to_account_info(),
+                    to: ctx.accounts.vault_usdc_ata.to_account_info(),
                     authority: ctx.accounts.config.to_account_info(),
                 },
                 signer_seeds,
             ),
-            usdx_amount,
+            usdc_amount,
         )?;
 
         let config = &mut ctx.accounts.config;
         config.last_refresh_ts = Clock::get()?.unix_timestamp;
 
         emit!(WithdrawCollateralEvent {
-            usdx_withdrawn: usdx_amount,
+            usdc_withdrawn: usdc_amount,
         });
         Ok(())
     }
@@ -838,14 +923,15 @@ pub mod lev_musdx_adaptor {
         )?;
 
         // Refresh obligation
+        let extra_reserves = build_refresh_obligation_reserves(
+            &ctx.accounts.save_obligation,
+            &ctx.accounts.musdx_reserve,
+            &ctx.accounts.usdc_reserve,
+        )?;
         save_cpi::refresh_obligation(
             &ctx.accounts.save_program,
             &ctx.accounts.save_obligation,
-            &ctx.accounts.clock,
-            &[
-                ctx.accounts.musdx_reserve.to_account_info(),
-                ctx.accounts.usdc_reserve.to_account_info(),
-            ],
+            &extra_reserves,
             signer_seeds,
         )?;
 
@@ -889,31 +975,32 @@ pub mod lev_musdx_adaptor {
         Ok(())
     }
 
-    /// Called by Voltr's deposit_strategy CPI. Moves USDX from vault's strategy
-    /// ATA (owned by vaultStrategyAuth) to config PDA's USDX ATA (remaining_accounts[0]),
-    /// then returns position value.
+    /// Called by Voltr's deposit_strategy CPI. Moves the vault's asset (USDC in
+    /// the current deployment) from vault_strategy_asset_ata (owned by
+    /// vaultStrategyAuth) to the config PDA's USDC ATA passed as
+    /// remaining_accounts[0], then returns position value.
     pub fn deposit<'info>(
         ctx: Context<'_, '_, 'info, 'info, VoltrDeposit<'info>>,
     ) -> Result<()> {
         let config = &ctx.accounts.strategy;
         require!(!config.paused, LevMusdxError::Paused);
 
-        // Transfer USDX from vaultStrategyAuth ATA to config PDA's USDX ATA
+        // Transfer vault asset (USDC) from vaultStrategyAuth ATA to config PDA's USDC ATA
         let idle = ctx.accounts.vault_strategy_asset_ata.amount;
         if idle > 0 && !ctx.remaining_accounts.is_empty() {
-            let config_usdx_ata = &ctx.remaining_accounts[0];
+            let config_asset_ata = &ctx.remaining_accounts[0];
             token::transfer(
                 CpiContext::new(
                     ctx.accounts.asset_token_program.to_account_info(),
                     Transfer {
                         from: ctx.accounts.vault_strategy_asset_ata.to_account_info(),
-                        to: config_usdx_ata.to_account_info(),
+                        to: config_asset_ata.to_account_info(),
                         authority: ctx.accounts.vault_strategy_auth.to_account_info(),
                     },
                 ),
                 idle,
             )?;
-            msg!("Transferred {} USDX to config PDA ATA", idle);
+            msg!("Transferred {} USDC to config PDA ATA", idle);
         }
 
         let position_value = idle
@@ -962,7 +1049,7 @@ pub struct InitializeConfig<'info> {
         seeds = [CONFIG_SEED, args.voltr_vault.as_ref()],
         bump,
     )]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 
@@ -975,7 +1062,7 @@ pub struct InitializeConfig<'info> {
 #[derive(Accounts)]
 pub struct SetConfig<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 }
@@ -983,7 +1070,7 @@ pub struct SetConfig<'info> {
 #[derive(Accounts)]
 pub struct SetPaused<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 }
@@ -991,7 +1078,7 @@ pub struct SetPaused<'info> {
 #[derive(Accounts)]
 pub struct ProposeAdmin<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 }
@@ -999,7 +1086,7 @@ pub struct ProposeAdmin<'info> {
 #[derive(Accounts)]
 pub struct AcceptAdmin<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub new_admin: Signer<'info>,
 }
@@ -1007,7 +1094,7 @@ pub struct AcceptAdmin<'info> {
 #[derive(Accounts)]
 pub struct CancelPendingAdmin<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 }
@@ -1015,7 +1102,7 @@ pub struct CancelPendingAdmin<'info> {
 #[derive(Accounts)]
 pub struct SetKeeper<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 }
@@ -1023,7 +1110,7 @@ pub struct SetKeeper<'info> {
 #[derive(Accounts)]
 pub struct InitSaveObligation<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 
@@ -1052,24 +1139,31 @@ pub struct InitSaveObligation<'info> {
 #[derive(Accounts)]
 pub struct DepositCollateral<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub depositor: Signer<'info>,
 
-    /// Strategy's USDX token account.
+    /// Strategy's USDC token account (entry asset — source of the deposit).
     #[account(mut)]
-    pub strategy_usdx_ata: Account<'info, TokenAccount>,
+    pub strategy_usdc_ata: Box<Account<'info, TokenAccount>>,
+
+    /// Strategy's USDX token account (intermediate, receives Jupiter swap out).
+    #[account(mut)]
+    pub strategy_usdx_ata: Box<Account<'info, TokenAccount>>,
 
     /// Strategy's mUSDX token account.
     #[account(mut)]
-    pub strategy_musdx_ata: Account<'info, TokenAccount>,
+    pub strategy_musdx_ata: Box<Account<'info, TokenAccount>>,
 
     /// Strategy's Save collateral token account.
     #[account(mut)]
-    pub strategy_user_collateral_ata: Account<'info, TokenAccount>,
+    pub strategy_user_collateral_ata: Box<Account<'info, TokenAccount>>,
+
+    /// USDC mint (entry asset).
+    pub usdc_mint: Box<Account<'info, Mint>>,
 
     /// USDX mint.
-    pub usdx_mint: Account<'info, Mint>,
+    pub usdx_mint: Box<Account<'info, Mint>>,
 
     /// CHECK: mUSDX program for wrap CPI.
     pub musdx_program: AccountInfo<'info>,
@@ -1080,11 +1174,15 @@ pub struct DepositCollateral<'info> {
 
     /// mUSDX mint (mutated during wrap).
     #[account(mut)]
-    pub musdx_mint: Account<'info, Mint>,
+    pub musdx_mint: Box<Account<'info, Mint>>,
 
     /// mUSDX vault for USDX deposits.
     #[account(mut)]
-    pub musdx_usdx_vault: Account<'info, TokenAccount>,
+    pub musdx_usdx_vault: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Jupiter V6 program. Validated by address.
+    #[account(address = jupiter_cpi::JUPITER_V6_PROGRAM_ID)]
+    pub jupiter_program: AccountInfo<'info>,
 
     /// CHECK: Save program.
     #[account(address = save_cpi::SAVE_PROGRAM_ID)]
@@ -1135,29 +1233,29 @@ pub struct DepositCollateral<'info> {
 #[derive(Accounts)]
 pub struct OpenLeverageStep<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     /// Keeper signer (L-2).
     pub keeper: Signer<'info>,
 
     /// Strategy's USDX token account.
     #[account(mut)]
-    pub strategy_usdx_ata: Account<'info, TokenAccount>,
+    pub strategy_usdx_ata: Box<Account<'info, TokenAccount>>,
 
     /// Strategy's mUSDX token account.
     #[account(mut)]
-    pub strategy_musdx_ata: Account<'info, TokenAccount>,
+    pub strategy_musdx_ata: Box<Account<'info, TokenAccount>>,
 
     /// Strategy's USDC token account.
     #[account(mut)]
-    pub strategy_usdc_ata: Account<'info, TokenAccount>,
+    pub strategy_usdc_ata: Box<Account<'info, TokenAccount>>,
 
     /// Strategy's Save collateral token account.
     #[account(mut)]
-    pub strategy_user_collateral_ata: Account<'info, TokenAccount>,
+    pub strategy_user_collateral_ata: Box<Account<'info, TokenAccount>>,
 
     /// USDX mint.
-    pub usdx_mint: Account<'info, Mint>,
+    pub usdx_mint: Box<Account<'info, Mint>>,
 
     /// CHECK: mUSDX program.
     pub musdx_program: AccountInfo<'info>,
@@ -1168,11 +1266,11 @@ pub struct OpenLeverageStep<'info> {
 
     /// mUSDX mint.
     #[account(mut)]
-    pub musdx_mint: Account<'info, Mint>,
+    pub musdx_mint: Box<Account<'info, Mint>>,
 
     /// mUSDX vault for USDX deposits.
     #[account(mut)]
-    pub musdx_usdx_vault: Account<'info, TokenAccount>,
+    pub musdx_usdx_vault: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Save program.
     #[account(address = save_cpi::SAVE_PROGRAM_ID)]
@@ -1245,7 +1343,7 @@ pub struct OpenLeverageStep<'info> {
 #[derive(Accounts)]
 pub struct CloseLeverageStep<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     /// Keeper signer (L-2).
     pub keeper: Signer<'info>,
@@ -1329,17 +1427,17 @@ pub struct CloseLeverageStep<'info> {
 #[derive(Accounts)]
 pub struct WithdrawCollateral<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     pub admin: Signer<'info>,
 
-    /// Strategy's USDX token account.
+    /// Strategy's USDC token account (source of idle USDC accumulated by close_leverage_step).
     #[account(mut)]
-    pub strategy_usdx_ata: Account<'info, TokenAccount>,
+    pub strategy_usdc_ata: Box<Account<'info, TokenAccount>>,
 
-    /// Vault's USDX token account (destination).
+    /// Vault's USDC idle token account (destination).
     #[account(mut)]
-    pub vault_usdx_ata: Account<'info, TokenAccount>,
+    pub vault_usdc_ata: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1347,7 +1445,7 @@ pub struct WithdrawCollateral<'info> {
 #[derive(Accounts)]
 pub struct RefreshPosition<'info> {
     #[account(mut, seeds = [CONFIG_SEED, config.voltr_vault.as_ref()], bump = config.bump)]
-    pub config: Account<'info, LevStrategyConfig>,
+    pub config: Box<Account<'info, LevStrategyConfig>>,
 
     /// CHECK: Save program.
     #[account(address = save_cpi::SAVE_PROGRAM_ID)]
@@ -1541,7 +1639,8 @@ pub struct KeeperChangedEvent {
 
 #[event]
 pub struct DepositCollateralEvent {
-    pub usdx_deposited: u64,
+    pub usdc_deposited: u64,
+    pub usdx_received: u64,
     pub musdx_collateral_added: u64,
     pub total_musdx_collateral: u64,
 }
@@ -1567,7 +1666,7 @@ pub struct CloseLeverageStepEvent {
 
 #[event]
 pub struct WithdrawCollateralEvent {
-    pub usdx_withdrawn: u64,
+    pub usdc_withdrawn: u64,
 }
 
 #[event]
@@ -1612,4 +1711,6 @@ pub enum LevMusdxError {
     NotPendingAdmin,
     #[msg("Timelock has not elapsed")]
     TimelockNotElapsed,
+    #[msg("Obligation state is malformed or has unexpected reserve counts")]
+    InvalidObligation,
 }

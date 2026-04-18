@@ -44,17 +44,22 @@ pub fn refresh_reserve<'info>(
     invoke_signed(&ix, &[save_program.clone(), reserve.clone(), reserve_liquidity_pyth_oracle.clone(), reserve_liquidity_switchboard_oracle.clone(), clock.clone()], signer_seeds).map_err(Into::into)
 }
 
+/// Save's fork uses `Clock::get()` syscall — no clock account. Accounts are
+/// `[obligation, ...deposit_reserves, ...borrow_reserves]` in that order,
+/// matching the obligation's on-chain deposits/borrows arrays.
 pub fn refresh_obligation<'info>(
     save_program: &AccountInfo<'info>,
     obligation: &AccountInfo<'info>,
-    clock: &AccountInfo<'info>,
     extra_reserves: &[AccountInfo<'info>],
     signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
-    let mut accounts = vec![AccountMeta::new(*obligation.key, false), AccountMeta::new_readonly(*clock.key, false)];
-    for r in extra_reserves { accounts.push(AccountMeta::new_readonly(*r.key, false)); }
+    // Extra reserves (deposits then borrows) must be WRITABLE — Save's fork
+    // runs update_borrow_attribution_values at the tail of refresh_obligation
+    // which calls Reserve::pack on each reserve.
+    let mut accounts = vec![AccountMeta::new(*obligation.key, false)];
+    for r in extra_reserves { accounts.push(AccountMeta::new(*r.key, false)); }
     let ix = Instruction { program_id: SAVE_PROGRAM_ID, accounts, data: vec![TAG_REFRESH_OBLIGATION] };
-    let mut infos = vec![save_program.clone(), obligation.clone(), clock.clone()];
+    let mut infos = vec![save_program.clone(), obligation.clone()];
     for r in extra_reserves { infos.push(r.clone()); }
     invoke_signed(&ix, &infos, signer_seeds).map_err(Into::into)
 }
@@ -112,6 +117,10 @@ pub fn deposit_reserve_liquidity_and_obligation_collateral<'info>(
     invoke_signed(&ix, &[save_program.clone(), source_liquidity.clone(), user_collateral.clone(), reserve.clone(), reserve_liquidity_supply.clone(), reserve_collateral_mint.clone(), lending_market.clone(), lending_market_authority.clone(), destination_deposit_collateral.clone(), obligation.clone(), obligation_owner.clone(), reserve_fee_receiver.clone(), reserve_liquidity_pyth_oracle.clone(), user_transfer_authority.clone(), token_program.clone()], signer_seeds).map_err(Into::into)
 }
 
+/// Save's fork uses `Clock::get()` syscall. Also requires:
+///   - `lending_market` WRITABLE (rate limiter pack)
+///   - `obligation.deposits` reserves appended after `token_program` as WRITABLE
+///     (Save's update_borrow_attribution_values packs each).
 #[allow(clippy::too_many_arguments)]
 pub fn withdraw_obligation_collateral_and_redeem_reserve_collateral<'info>(
     save_program: &AccountInfo<'info>, source_withdraw_collateral_supply: &AccountInfo<'info>,
@@ -120,56 +129,76 @@ pub fn withdraw_obligation_collateral_and_redeem_reserve_collateral<'info>(
     lending_market_authority: &AccountInfo<'info>, user_liquidity: &AccountInfo<'info>,
     reserve_collateral_mint: &AccountInfo<'info>, reserve_liquidity_supply: &AccountInfo<'info>,
     obligation_owner: &AccountInfo<'info>, user_transfer_authority: &AccountInfo<'info>,
-    clock: &AccountInfo<'info>, token_program: &AccountInfo<'info>, collateral_amount: u64, signer_seeds: &[&[&[u8]]],
+    token_program: &AccountInfo<'info>,
+    deposit_reserves: &[AccountInfo<'info>],
+    collateral_amount: u64, signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     let mut data = Vec::with_capacity(9);
     data.push(TAG_WITHDRAW_OBLIGATION_COLLATERAL_AND_REDEEM_RESERVE_COLLATERAL);
     data.extend_from_slice(&collateral_amount.to_le_bytes());
-    let ix = Instruction {
-        program_id: SAVE_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*source_withdraw_collateral_supply.key, false), AccountMeta::new(*destination_collateral.key, false),
-            AccountMeta::new(*withdraw_reserve.key, false), AccountMeta::new(*obligation.key, false),
-            AccountMeta::new_readonly(*lending_market.key, false), AccountMeta::new_readonly(*lending_market_authority.key, false),
-            AccountMeta::new(*user_liquidity.key, false), AccountMeta::new(*reserve_collateral_mint.key, false),
-            AccountMeta::new(*reserve_liquidity_supply.key, false), AccountMeta::new_readonly(*obligation_owner.key, true),
-            AccountMeta::new_readonly(*user_transfer_authority.key, true), AccountMeta::new_readonly(*clock.key, false),
-            AccountMeta::new_readonly(*token_program.key, false),
-        ],
-        data,
-    };
-    invoke_signed(&ix, &[save_program.clone(), source_withdraw_collateral_supply.clone(), destination_collateral.clone(), withdraw_reserve.clone(), obligation.clone(), lending_market.clone(), lending_market_authority.clone(), user_liquidity.clone(), reserve_collateral_mint.clone(), reserve_liquidity_supply.clone(), obligation_owner.clone(), user_transfer_authority.clone(), clock.clone(), token_program.clone()], signer_seeds).map_err(Into::into)
+    let mut accounts = vec![
+        AccountMeta::new(*source_withdraw_collateral_supply.key, false), AccountMeta::new(*destination_collateral.key, false),
+        AccountMeta::new(*withdraw_reserve.key, false), AccountMeta::new(*obligation.key, false),
+        AccountMeta::new(*lending_market.key, false), AccountMeta::new_readonly(*lending_market_authority.key, false),
+        AccountMeta::new(*user_liquidity.key, false), AccountMeta::new(*reserve_collateral_mint.key, false),
+        AccountMeta::new(*reserve_liquidity_supply.key, false), AccountMeta::new_readonly(*obligation_owner.key, true),
+        AccountMeta::new_readonly(*user_transfer_authority.key, true),
+        AccountMeta::new_readonly(*token_program.key, false),
+    ];
+    let mut infos = vec![save_program.clone(), source_withdraw_collateral_supply.clone(), destination_collateral.clone(), withdraw_reserve.clone(), obligation.clone(), lending_market.clone(), lending_market_authority.clone(), user_liquidity.clone(), reserve_collateral_mint.clone(), reserve_liquidity_supply.clone(), obligation_owner.clone(), user_transfer_authority.clone(), token_program.clone()];
+    for r in deposit_reserves {
+        accounts.push(AccountMeta::new(*r.key, false));
+        infos.push(r.clone());
+    }
+    let ix = Instruction { program_id: SAVE_PROGRAM_ID, accounts, data };
+    invoke_signed(&ix, &infos, signer_seeds).map_err(Into::into)
 }
 
+/// Save's fork uses `Clock::get()` syscall for this ix — no clock account.
+/// It ALSO requires the obligation's current deposit reserves to be appended
+/// after `token_program` (processor.rs has a "HACK: fast forward through the
+/// deposit reserve infos" loop at line 1864 that reads one account per
+/// `obligation.deposits` entry). Pass them in the same order the obligation
+/// stores them.
 #[allow(clippy::too_many_arguments)]
 pub fn borrow_obligation_liquidity<'info>(
     save_program: &AccountInfo<'info>, source_liquidity: &AccountInfo<'info>, destination_liquidity: &AccountInfo<'info>,
     borrow_reserve: &AccountInfo<'info>, borrow_reserve_fee_receiver: &AccountInfo<'info>,
     obligation: &AccountInfo<'info>, lending_market: &AccountInfo<'info>, lending_market_authority: &AccountInfo<'info>,
-    obligation_owner: &AccountInfo<'info>, clock: &AccountInfo<'info>, token_program: &AccountInfo<'info>,
+    obligation_owner: &AccountInfo<'info>, token_program: &AccountInfo<'info>,
+    deposit_reserves: &[AccountInfo<'info>],
     host_fee_receiver: Option<&AccountInfo<'info>>, liquidity_amount: u64, signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     let mut data = Vec::with_capacity(9);
     data.push(TAG_BORROW_OBLIGATION_LIQUIDITY);
     data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    // lending_market must be writable — Save updates its rate_limiter during
+    // borrow. Similarly deposit reserves are writable (for interest refresh).
     let mut accounts = vec![
         AccountMeta::new(*source_liquidity.key, false), AccountMeta::new(*destination_liquidity.key, false),
         AccountMeta::new(*borrow_reserve.key, false), AccountMeta::new(*borrow_reserve_fee_receiver.key, false),
-        AccountMeta::new(*obligation.key, false), AccountMeta::new_readonly(*lending_market.key, false),
+        AccountMeta::new(*obligation.key, false), AccountMeta::new(*lending_market.key, false),
         AccountMeta::new_readonly(*lending_market_authority.key, false), AccountMeta::new_readonly(*obligation_owner.key, true),
-        AccountMeta::new_readonly(*clock.key, false), AccountMeta::new_readonly(*token_program.key, false),
+        AccountMeta::new_readonly(*token_program.key, false),
     ];
-    let mut infos = vec![save_program.clone(), source_liquidity.clone(), destination_liquidity.clone(), borrow_reserve.clone(), borrow_reserve_fee_receiver.clone(), obligation.clone(), lending_market.clone(), lending_market_authority.clone(), obligation_owner.clone(), clock.clone(), token_program.clone()];
+    let mut infos = vec![save_program.clone(), source_liquidity.clone(), destination_liquidity.clone(), borrow_reserve.clone(), borrow_reserve_fee_receiver.clone(), obligation.clone(), lending_market.clone(), lending_market_authority.clone(), obligation_owner.clone(), token_program.clone()];
+    // deposit reserves must be writable — Save calls Reserve::pack on each
+    // during update_borrow_attribution_values.
+    for r in deposit_reserves {
+        accounts.push(AccountMeta::new(*r.key, false));
+        infos.push(r.clone());
+    }
     if let Some(host) = host_fee_receiver { accounts.push(AccountMeta::new(*host.key, false)); infos.push(host.clone()); }
     let ix = Instruction { program_id: SAVE_PROGRAM_ID, accounts, data };
     invoke_signed(&ix, &infos, signer_seeds).map_err(Into::into)
 }
 
+/// Save's fork uses `Clock::get()` syscall for this ix — no clock account.
 #[allow(clippy::too_many_arguments)]
 pub fn repay_obligation_liquidity<'info>(
     save_program: &AccountInfo<'info>, source_liquidity: &AccountInfo<'info>, destination_liquidity: &AccountInfo<'info>,
     repay_reserve: &AccountInfo<'info>, obligation: &AccountInfo<'info>, lending_market: &AccountInfo<'info>,
-    user_transfer_authority: &AccountInfo<'info>, clock: &AccountInfo<'info>, token_program: &AccountInfo<'info>,
+    user_transfer_authority: &AccountInfo<'info>, token_program: &AccountInfo<'info>,
     liquidity_amount: u64, signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     let mut data = Vec::with_capacity(9);
@@ -181,9 +210,9 @@ pub fn repay_obligation_liquidity<'info>(
             AccountMeta::new(*source_liquidity.key, false), AccountMeta::new(*destination_liquidity.key, false),
             AccountMeta::new(*repay_reserve.key, false), AccountMeta::new(*obligation.key, false),
             AccountMeta::new_readonly(*lending_market.key, false), AccountMeta::new_readonly(*user_transfer_authority.key, true),
-            AccountMeta::new_readonly(*clock.key, false), AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
         ],
         data,
     };
-    invoke_signed(&ix, &[save_program.clone(), source_liquidity.clone(), destination_liquidity.clone(), repay_reserve.clone(), obligation.clone(), lending_market.clone(), user_transfer_authority.clone(), clock.clone(), token_program.clone()], signer_seeds).map_err(Into::into)
+    invoke_signed(&ix, &[save_program.clone(), source_liquidity.clone(), destination_liquidity.clone(), repay_reserve.clone(), obligation.clone(), lending_market.clone(), user_transfer_authority.clone(), token_program.clone()], signer_seeds).map_err(Into::into)
 }

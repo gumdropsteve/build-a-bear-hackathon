@@ -186,19 +186,19 @@ async function resumePendingActions() {
 // =============================================================================
 
 const ADAPTOR_PROGRAM = new PublicKey(
-  "5k9CgNiSXSRbLG6PaSSJwkriYkg8i9hdyc8gkDBj3jyv"
+  "Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr"
 );
 const MUSDX_PROGRAM = new PublicKey(
   "5NTrBzBD92B8qRDquvxBihpcxQHmCNqu2WtmoT9RRFpK"
 );
 const VAULT = new PublicKey(
-  "2udsDEMJzSpcJiGqULC29C9wJufoerY5SAwmUYTMHNFr"
+  "CpLxaSioYMjJscmX4gH13iAkrxrMLJTH1PXYQMMeuKB5"
 );
 const CONFIG_PDA = new PublicKey(
-  "8FtycUPmo3nGbzvoTUsEwMi5orX9EUiCQVNwBY5MxrJp"
+  "62cwM9us4WVVaXRQLtsG7NjYGTGJokzPkTQwS3SgYGrC"
 );
 const SAVE_OBLIGATION = new PublicKey(
-  "EDW2rngpfzsgAiuQwxa1CuXgcZTwuifLhrLtpX1hzK5s"
+  "HQsY3RjLS7tMVoWrUYqLwfXeMwfeah8QMHdYGeXcZtkS"
 );
 const SAVE_PROGRAM = new PublicKey(
   "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
@@ -230,14 +230,17 @@ const MUSDX_RESERVE_LIQUIDITY_SUPPLY = new PublicKey(
   "8hNBSQU2ELd4YN598MUtyjrFj8WR2to5EBCss8fooLXz"
 );
 const MUSDX_RESERVE_FEE_RECEIVER = new PublicKey(
-  "nu11111111111111111111111111111111111111111"
+  "6iUSMNJHXW1Un1EcDNqtqYYNQzt3EKT5n7EGpSPpWKmb"
 );
 const MUSDX_RESERVE_COLLATERAL_SUPPLY = new PublicKey(
   "H7pGfV3seH4a6sQNj46QWtxT1NtpVMbAtYN4HMHZJA99"
 );
-// mUSDX reserve pyth oracle is Save's null marker
+// mUSDX reserve pyth oracle: repointed to USDC's Pyth Pull feed since mUSDX
+// pegs 1:1 to USDX (≈ $1). Pyth Pull feeds have abundant permissionless
+// crankers, so this removes the Switchboard crank dependency that was
+// blocking the leverage loop.
 const MUSDX_RESERVE_PYTH_ORACLE = new PublicKey(
-  "nu11111111111111111111111111111111111111111"
+  "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"
 );
 const MUSDX_RESERVE_SWITCHBOARD_ORACLE = new PublicKey(
   "DcXQmwQ1bz177STVkLqubbb5ohjTVnJzMB2PTQkWvbmQ"
@@ -249,14 +252,13 @@ const USDC_RESERVE_LIQUIDITY_SUPPLY = new PublicKey(
   "DAxZ7hPmJoc1vDqR75Fp1tFntxvJevpiwXbSnYt6bFQy"
 );
 const USDC_RESERVE_FEE_RECEIVER = new PublicKey(
+  "5Gdxn4yquneifE6uk9tK8X4CqHfWKjW2BvYU25hAykwP"
+);
+const USDC_RESERVE_PYTH_ORACLE = new PublicKey(
   "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"
 );
-// USDC reserve pyth oracle is null — use system program
-const USDC_RESERVE_PYTH_ORACLE = new PublicKey(
-  "11111111111111111111111111111111"
-);
 const USDC_RESERVE_SWITCHBOARD_ORACLE = new PublicKey(
-  "5z4gHKQNvjqpcAKGvMiLi8SYKw7iDfsbYjyUdqDYYZZ6"
+  "nu11111111111111111111111111111111111111111"
 );
 const LENDING_MARKET_AUTHORITY = new PublicKey(
   "GDzcMzrtkr9DRJ6dhV7uo2jkHA3oNzAfKENtgM8ccHiS"
@@ -477,7 +479,8 @@ async function sendWithRetry(
   connection: Connection,
   ixs: TransactionInstruction[],
   signers: Keypair[],
-  computeUnits?: number
+  computeUnits?: number,
+  addressLookupTables?: PublicKey[]
 ): Promise<string> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -498,12 +501,27 @@ async function sendWithRetry(
         tx.add(ix);
       }
 
-      // Send raw transaction and confirm via polling (Alchemy doesn't support signatureSubscribe)
-      tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
-      tx.feePayer = signers[0].publicKey;
-      tx.sign(...signers);
+      // Use versioned transaction with address lookup tables for Jupiter routes
+      const { blockhash } = await connection.getLatestBlockhash("confirmed");
 
-      const rawTx = tx.serialize();
+      // Load any address lookup tables
+      let lookupTables: AddressLookupTableAccount[] = [];
+      if (addressLookupTables && addressLookupTables.length > 0) {
+        for (const altAddr of addressLookupTables) {
+          const alt = await connection.getAddressLookupTable(altAddr);
+          if (alt.value) lookupTables.push(alt.value);
+        }
+      }
+
+      const messageV0 = new TransactionMessage({
+        payerKey: signers[0].publicKey,
+        recentBlockhash: blockhash,
+        instructions: tx.instructions,
+      }).compileToV0Message(lookupTables);
+      const vtx = new VersionedTransaction(messageV0);
+      vtx.sign(signers);
+
+      const rawTx = vtx.serialize();
       const sig = await connection.sendRawTransaction(rawTx, {
         skipPreflight: false,
         preflightCommitment: "confirmed",
@@ -597,7 +615,8 @@ async function getJupiterQuote(
     `inputMint=${inputMint.toBase58()}` +
     `&outputMint=${outputMint.toBase58()}` +
     `&amount=${amount.toString()}` +
-    `&slippageBps=${slippageBps}`;
+    `&slippageBps=${slippageBps}` +
+    `&maxAccounts=30`;
 
   logInfo(`Fetching Jupiter quote`, {
     inputMint: inputMint.toBase58(),
@@ -711,64 +730,59 @@ async function getTokenBalance(
 
 function buildDepositCollateralIx(
   depositor: PublicKey,
-  usdxAmount: bigint
+  usdcAmount: bigint,
+  jupiterData: Buffer,
+  jupiterAccounts: Array<{
+    pubkey: PublicKey;
+    isSigner: boolean;
+    isWritable: boolean;
+  }>
 ): TransactionInstruction {
   const disc = anchorDisc("deposit_collateral");
+
+  // usdc_amount (u64) + jupiter_data (Vec<u8>: 4-byte len + bytes)
   const amountBuf = Buffer.alloc(8);
-  amountBuf.writeBigUInt64LE(usdxAmount);
-  const data = Buffer.concat([disc, amountBuf]);
+  amountBuf.writeBigUInt64LE(usdcAmount);
+
+  const jupLenBuf = Buffer.alloc(4);
+  jupLenBuf.writeUInt32LE(jupiterData.length);
+
+  const data = Buffer.concat([disc, amountBuf, jupLenBuf, jupiterData]);
+
+  const keys = [
+    { pubkey: CONFIG_PDA, isSigner: false, isWritable: true },
+    { pubkey: depositor, isSigner: true, isWritable: false },
+    { pubkey: STRATEGY_USDC_ATA, isSigner: false, isWritable: true },
+    { pubkey: STRATEGY_USDX_ATA, isSigner: false, isWritable: true },
+    { pubkey: STRATEGY_MUSDX_ATA, isSigner: false, isWritable: true },
+    { pubkey: STRATEGY_COLLATERAL_ATA, isSigner: false, isWritable: true },
+    { pubkey: USDC_MINT, isSigner: false, isWritable: false },
+    { pubkey: USDX_MINT, isSigner: false, isWritable: false },
+    { pubkey: MUSDX_PROGRAM, isSigner: false, isWritable: false },
+    { pubkey: MUSDX_STATE, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_MINT_PDA, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_USDX_VAULT, isSigner: false, isWritable: true },
+    { pubkey: JUPITER_V6_PROGRAM, isSigner: false, isWritable: false },
+    { pubkey: SAVE_PROGRAM, isSigner: false, isWritable: false },
+    { pubkey: SAVE_OBLIGATION, isSigner: false, isWritable: true },
+    { pubkey: LENDING_MARKET, isSigner: false, isWritable: false },
+    { pubkey: LENDING_MARKET_AUTHORITY, isSigner: false, isWritable: false },
+    { pubkey: MUSDX_RESERVE, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_RESERVE_LIQUIDITY_SUPPLY, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_COLLATERAL_MINT, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_RESERVE_COLLATERAL_SUPPLY, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_RESERVE_FEE_RECEIVER, isSigner: false, isWritable: true },
+    { pubkey: MUSDX_RESERVE_PYTH_ORACLE, isSigner: false, isWritable: false },
+    { pubkey: MUSDX_RESERVE_SWITCHBOARD_ORACLE, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
+    // Jupiter route accounts follow as remaining_accounts
+    ...jupiterAccounts,
+  ];
 
   return new TransactionInstruction({
     programId: ADAPTOR_PROGRAM,
-    keys: [
-      { pubkey: CONFIG_PDA, isSigner: false, isWritable: true },
-      { pubkey: depositor, isSigner: true, isWritable: false },
-      { pubkey: STRATEGY_USDX_ATA, isSigner: false, isWritable: true },
-      { pubkey: STRATEGY_MUSDX_ATA, isSigner: false, isWritable: true },
-      { pubkey: STRATEGY_COLLATERAL_ATA, isSigner: false, isWritable: true },
-      { pubkey: USDX_MINT, isSigner: false, isWritable: false },
-      { pubkey: MUSDX_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: MUSDX_STATE, isSigner: false, isWritable: true },
-      { pubkey: MUSDX_MINT_PDA, isSigner: false, isWritable: true },
-      { pubkey: MUSDX_USDX_VAULT, isSigner: false, isWritable: true },
-      { pubkey: SAVE_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: SAVE_OBLIGATION, isSigner: false, isWritable: true },
-      { pubkey: LENDING_MARKET, isSigner: false, isWritable: false },
-      { pubkey: LENDING_MARKET_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: MUSDX_RESERVE, isSigner: false, isWritable: true },
-      {
-        pubkey: MUSDX_RESERVE_LIQUIDITY_SUPPLY,
-        isSigner: false,
-        isWritable: true,
-      },
-      {
-        pubkey: MUSDX_COLLATERAL_MINT,
-        isSigner: false,
-        isWritable: true,
-      },
-      {
-        pubkey: MUSDX_RESERVE_COLLATERAL_SUPPLY,
-        isSigner: false,
-        isWritable: true,
-      },
-      {
-        pubkey: MUSDX_RESERVE_FEE_RECEIVER,
-        isSigner: false,
-        isWritable: true,
-      },
-      {
-        pubkey: MUSDX_RESERVE_PYTH_ORACLE,
-        isSigner: false,
-        isWritable: false,
-      },
-      {
-        pubkey: MUSDX_RESERVE_SWITCHBOARD_ORACLE,
-        isSigner: false,
-        isWritable: false,
-      },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
-    ],
+    keys,
     data,
   });
 }
@@ -808,7 +822,8 @@ function buildOpenLeverageStepIx(
     { pubkey: MUSDX_USDX_VAULT, isSigner: false, isWritable: true },
     { pubkey: SAVE_PROGRAM, isSigner: false, isWritable: false },
     { pubkey: SAVE_OBLIGATION, isSigner: false, isWritable: true },
-    { pubkey: LENDING_MARKET, isSigner: false, isWritable: false },
+    // Save's fork updates the lending_market's rate_limiter during borrow.
+    { pubkey: LENDING_MARKET, isSigner: false, isWritable: true },
     { pubkey: LENDING_MARKET_AUTHORITY, isSigner: false, isWritable: false },
     { pubkey: MUSDX_RESERVE, isSigner: false, isWritable: true },
     {
@@ -823,6 +838,11 @@ function buildOpenLeverageStepIx(
     },
     {
       pubkey: MUSDX_RESERVE_COLLATERAL_SUPPLY,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: MUSDX_RESERVE_FEE_RECEIVER,
       isSigner: false,
       isWritable: true,
     },
@@ -901,7 +921,8 @@ function buildCloseLeverageStepIx(
     { pubkey: STRATEGY_COLLATERAL_ATA, isSigner: false, isWritable: true },
     { pubkey: SAVE_PROGRAM, isSigner: false, isWritable: false },
     { pubkey: SAVE_OBLIGATION, isSigner: false, isWritable: true },
-    { pubkey: LENDING_MARKET, isSigner: false, isWritable: false },
+    // Save's fork updates the lending_market's rate_limiter on withdraw+redeem.
+    { pubkey: LENDING_MARKET, isSigner: false, isWritable: true },
     { pubkey: LENDING_MARKET_AUTHORITY, isSigner: false, isWritable: false },
     { pubkey: MUSDX_RESERVE, isSigner: false, isWritable: true },
     {
@@ -980,8 +1001,8 @@ function calculateBorrowAmount(config: ConfigState): bigint {
   }
 
   // Target total collateral at desired leverage:
-  //   target_collateral = equity * targetLeverageBps / 10000
-  const targetCollateral = (equity * targetLevBps) / 10000n;
+  // targetLeverageBps stores leverage * 100 (400 = 4x), so divide by 100
+  const targetCollateral = (equity * targetLevBps) / 100n;
 
   if (targetCollateral <= collateral) {
     return 0n; // already at or above target
@@ -1039,23 +1060,23 @@ async function executeDeposit(
     return;
   }
 
-  // Check vault idle USDX first and move to strategy ATA via Voltr deposit_strategy
+  // Check vault idle USDC first and move to strategy ATA via Voltr deposit_strategy
   const { VoltrClient } = require("@voltr/vault-sdk");
   const { BN } = require("bn.js");
   const vc = new VoltrClient(connection);
   const vaultData = await vc.fetchVaultAccount(VAULT);
   const vaultIdleAta = new PublicKey(vaultData.asset.idleAta);
   const vaultIdleBalance = await getTokenBalance(connection, vaultIdleAta);
-  logInfo(`Vault idle USDX: ${vaultIdleBalance.toString()}`);
+  logInfo(`Vault idle USDC: ${vaultIdleBalance.toString()}`);
 
   if (vaultIdleBalance > BigInt(0)) {
-    logInfo(`Moving ${vaultIdleBalance.toString()} USDX from vault idle to strategy...`);
+    logInfo(`Moving ${vaultIdleBalance.toString()} USDC from vault idle to strategy...`);
 
     // Ensure vault_strategy_asset_ata exists (owned by Voltr's vaultStrategyAuth PDA)
     const { vaultStrategyAuth } = vc.findVaultStrategyAddresses(VAULT, CONFIG_PDA);
-    const vaultStrategyAssetAta = getAssociatedTokenAddressSync(USDX_MINT, vaultStrategyAuth, true);
+    const vaultStrategyAssetAta = getAssociatedTokenAddressSync(USDC_MINT, vaultStrategyAuth, true);
     const createVsaAtaIx = createAssociatedTokenAccountIdempotentInstruction(
-      keeper.publicKey, vaultStrategyAssetAta, vaultStrategyAuth, USDX_MINT
+      keeper.publicKey, vaultStrategyAssetAta, vaultStrategyAuth, USDC_MINT
     );
     try {
       await sendWithRetry(connection, [createVsaAtaIx], [keeper], 200_000);
@@ -1073,40 +1094,55 @@ async function executeDeposit(
       {
         manager: keeper.publicKey,
         vault: VAULT,
-        vaultAssetMint: USDX_MINT,
+        vaultAssetMint: USDC_MINT,
         strategy: CONFIG_PDA,
         assetTokenProgram: TOKEN_PROGRAM_ID,
         adaptorProgram: ADAPTOR_PROGRAM,
         remainingAccounts: [
-          { pubkey: STRATEGY_USDX_ATA, isSigner: false, isWritable: true },
+          { pubkey: STRATEGY_USDC_ATA, isSigner: false, isWritable: true },
         ],
       }
     );
     const moveSig = await sendWithRetry(connection, [depositStrategyIx], [keeper], 400_000);
-    logInfo(`Moved USDX to strategy`, { signature: moveSig });
+    logInfo(`Moved USDC to strategy`, { signature: moveSig });
   }
 
-  // Check idle USDX balance in strategy ATA
-  const idleUsdx = await getTokenBalance(connection, STRATEGY_USDX_ATA);
-  logInfo(`Idle USDX in strategy ATA: ${idleUsdx.toString()}`);
+  // Check idle USDC balance in strategy ATA
+  const idleUsdc = await getTokenBalance(connection, STRATEGY_USDC_ATA);
+  logInfo(`Idle USDC in strategy ATA: ${idleUsdc.toString()}`);
 
-  if (idleUsdx < BigInt(MIN_DEPOSIT_THRESHOLD)) {
-    logInfo("Not enough idle USDX to deposit, skipping");
+  if (idleUsdc < BigInt(MIN_DEPOSIT_THRESHOLD)) {
+    logInfo("Not enough idle USDC to deposit, skipping");
     return;
   }
 
-  // Step 1: Deposit collateral (wrap USDX -> mUSDX and post as Save collateral)
-  logInfo(`Depositing ${idleUsdx.toString()} USDX as collateral...`);
-  const depositIx = buildDepositCollateralIx(keeper.publicKey, idleUsdx);
+  // Step 1: Fetch Jupiter quote for USDC -> USDX so we can swap inside deposit_collateral
+  const quote = await getJupiterQuote(USDC_MINT, USDX_MINT, idleUsdc);
+  const swapResp = await getJupiterSwapInstructions(quote, CONFIG_PDA);
+  if (!swapResp.swapInstruction) {
+    throw new Error("Jupiter did not return a swap instruction for USDC->USDX");
+  }
+  const { data: jupiterData, accounts: jupiterAccounts } =
+    extractJupiterRouteData(swapResp.swapInstruction);
+
+  // Step 2: deposit_collateral — swap USDC->USDX, wrap to mUSDX, post as Save collateral
+  logInfo(`Depositing ${idleUsdc.toString()} USDC as collateral (via Jupiter USDC→USDX)...`);
+  const depositIx = buildDepositCollateralIx(
+    keeper.publicKey,
+    idleUsdc,
+    jupiterData,
+    jupiterAccounts
+  );
   const depositSig = await sendWithRetry(
     connection,
     [depositIx],
     [keeper],
-    400_000
+    600_000,
+    swapResp.addressLookupTableAddresses?.map((a) => new PublicKey(a))
   );
   logInfo(`Collateral deposited`, { signature: depositSig });
 
-  // Step 2: Open leverage steps until target reached
+  // Step 3: Open leverage steps until target reached
   await executeLeverageLoop(connection, keeper);
 }
 
@@ -1131,12 +1167,14 @@ async function executeLeverageLoop(
     }
 
     // Check if we've reached target leverage
+    // target stores leverage * 100 (4x = 400), current stores leverage * 10000 (4x = 40000)
+    const targetCurrentScale = config.targetLeverageBps * 100;
     if (
-      config.currentLeverageBps >= config.targetLeverageBps &&
+      config.currentLeverageBps >= targetCurrentScale &&
       config.currentLeverageBps > 0
     ) {
       logInfo(
-        `Target leverage reached: ${config.currentLeverageBps} bps >= ${config.targetLeverageBps} bps`
+        `Target leverage reached: ${config.currentLeverageBps} bps >= ${targetCurrentScale} bps (target ${config.targetLeverageBps})`
       );
       break;
     }
@@ -1208,7 +1246,16 @@ async function executeOpenLeverageStep(
     jupiterAccounts
   );
 
-  return sendWithRetry(connection, [ix], [keeper], 1_200_000);
+  // Pass our ALT + Jupiter's address lookup tables for versioned transaction compression
+  const OUR_ALT = new PublicKey("2eDysx624w2kwFsuK4y8wkJzm2dksm4DQTB6f4AeSju2");
+  const altPubkeys = [
+    OUR_ALT,
+    ...(swapIxResp.addressLookupTableAddresses || []).map(
+      (a: string) => new PublicKey(a)
+    ),
+  ];
+
+  return sendWithRetry(connection, [ix], [keeper], 1_200_000, altPubkeys);
 }
 
 /**
@@ -1756,6 +1803,10 @@ async function main(): Promise<void> {
       await executeFullUnwind(connection, keeper);
       break;
 
+    case "leverage":
+      await executeLeverageLoop(connection, keeper);
+      break;
+
     case "status":
       await printStatus(connection);
       break;
@@ -1763,7 +1814,7 @@ async function main(): Promise<void> {
     default:
       console.error(
         `Unknown command: ${command}\n` +
-          `Usage: npx ts-node keeper/index.ts [server|deposit|unwind|unwind-all|status]`
+          `Usage: npx ts-node keeper/index.ts [server|deposit|unwind|unwind-all|leverage|status]`
       );
       process.exit(1);
   }
