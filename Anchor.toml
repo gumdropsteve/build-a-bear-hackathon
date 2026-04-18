@@ -7,17 +7,17 @@ skip-lint = false
 [programs.localnet]
 musdx = "LMo3w1NAqeTBPwPcbgt3W5aqbU22eiXYdeRXFXB2FpF"
 lev_musdx_adaptor = "Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr"
-orca_adaptor = "7yiMutzu66FexVadQSzfDunWiUiPGqC5XLATZiQDyWY5"
+orca_adaptor = "2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q"
 
 [programs.devnet]
 musdx = "5NTrBzBD92B8qRDquvxBihpcxQHmCNqu2WtmoT9RRFpK"
 lev_musdx_adaptor = "Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr"
-orca_adaptor = "7yiMutzu66FexVadQSzfDunWiUiPGqC5XLATZiQDyWY5"
+orca_adaptor = "2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q"
 
 [programs.mainnet]
 musdx = "5NTrBzBD92B8qRDquvxBihpcxQHmCNqu2WtmoT9RRFpK"
 lev_musdx_adaptor = "Bjepyh9UYAsJJkQ9meiVSXfgZXQFNZUn5ihqLysekpDr"
-orca_adaptor = "7yiMutzu66FexVadQSzfDunWiUiPGqC5XLATZiQDyWY5"
+orca_adaptor = "2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q"
 
 [registry]
 url = "https://api.apr.dev"

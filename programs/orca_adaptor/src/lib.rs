@@ -14,7 +14,7 @@ use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 mod whirlpool_cpi;
 
-declare_id!("7yiMutzu66FexVadQSzfDunWiUiPGqC5XLATZiQDyWY5");
+declare_id!("2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q");
 
 pub const CONFIG_SEED: &[u8] = b"orca_strategy_config";
 
@@ -182,6 +182,94 @@ pub mod orca_adaptor {
         });
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Position management — Phase 2
+    // -----------------------------------------------------------------------
+
+    /// Open a concentrated-liquidity position on a Whirlpool. The Position
+    /// NFT is minted to the config PDA's position_token_account, making the
+    /// strategy the sole controller of the position.
+    ///
+    /// `tick_lower_index` and `tick_upper_index` must each be a multiple of
+    /// the Whirlpool's `tick_spacing` and satisfy `lower < upper`.
+    pub fn open_position(
+        ctx: Context<OpenPositionAccounts>,
+        tick_lower_index: i32,
+        tick_upper_index: i32,
+        position_bump: u8,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, OrcaAdaptorError::Paused);
+        require_keys_eq!(
+            ctx.accounts.keeper.key(),
+            config.keeper,
+            OrcaAdaptorError::NotKeeper
+        );
+        require!(
+            tick_lower_index < tick_upper_index,
+            OrcaAdaptorError::InvalidTickRange
+        );
+
+        whirlpool_cpi::open_position(
+            &ctx.accounts.whirlpool_program,
+            &ctx.accounts.funder.to_account_info(),
+            &ctx.accounts.config.to_account_info(), // owner = config PDA
+            &ctx.accounts.position,
+            &ctx.accounts.position_mint.to_account_info(),
+            &ctx.accounts.position_token_account,
+            &ctx.accounts.whirlpool,
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.rent.to_account_info(),
+            &ctx.accounts.associated_token_program.to_account_info(),
+            position_bump,
+            tick_lower_index,
+            tick_upper_index,
+        )?;
+
+        emit!(OpenPositionEvent {
+            whirlpool: ctx.accounts.whirlpool.key(),
+            position: ctx.accounts.position.key(),
+            position_mint: ctx.accounts.position_mint.key(),
+            tick_lower_index,
+            tick_upper_index,
+        });
+        Ok(())
+    }
+
+    /// Close a previously-opened position. Whirlpool requires 0 liquidity
+    /// and 0 fees/rewards owed before the position can be closed; call
+    /// `decrease_liquidity` + any collect ixs first (Phase 3 / follow-up).
+    pub fn close_position(ctx: Context<ClosePositionAccounts>) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, OrcaAdaptorError::Paused);
+        require_keys_eq!(
+            ctx.accounts.keeper.key(),
+            config.keeper,
+            OrcaAdaptorError::NotKeeper
+        );
+
+        let voltr_vault = config.voltr_vault;
+        let bump = config.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, voltr_vault.as_ref(), &[bump]]];
+
+        whirlpool_cpi::close_position(
+            &ctx.accounts.whirlpool_program,
+            &ctx.accounts.config.to_account_info(), // position_authority (PDA)
+            &ctx.accounts.receiver,
+            &ctx.accounts.position,
+            &ctx.accounts.position_mint,
+            &ctx.accounts.position_token_account,
+            &ctx.accounts.token_program.to_account_info(),
+            signer_seeds,
+        )?;
+
+        emit!(ClosePositionEvent {
+            position: ctx.accounts.position.key(),
+        });
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -323,6 +411,85 @@ pub struct SwapAccounts<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct OpenPositionAccounts<'info> {
+    #[account(
+        seeds = [CONFIG_SEED, config.voltr_vault.as_ref()],
+        bump = config.bump,
+    )]
+    pub config: Box<Account<'info, OrcaStrategyConfig>>,
+
+    pub keeper: Signer<'info>,
+
+    /// Funder pays rent for the new Position account and token mint.
+    #[account(mut)]
+    pub funder: Signer<'info>,
+
+    /// New Keypair generated client-side; the Whirlpool program inits this
+    /// account and makes it a 0-decimal NFT mint.
+    #[account(mut)]
+    pub position_mint: Signer<'info>,
+
+    /// CHECK: Position account — initialized by Whirlpool. PDA seeds:
+    /// `[b"position", position_mint.key()]` under the Whirlpool program.
+    #[account(mut)]
+    pub position: AccountInfo<'info>,
+
+    /// CHECK: ATA(position_mint, config_pda) — receives the single Position
+    /// NFT. Whirlpool creates this via the AssociatedToken program.
+    #[account(mut)]
+    pub position_token_account: AccountInfo<'info>,
+
+    /// CHECK: Whirlpool this position is on.
+    pub whirlpool: AccountInfo<'info>,
+
+    /// CHECK: Orca Whirlpool program.
+    #[account(address = whirlpool_cpi::WHIRLPOOL_PROGRAM_ID)]
+    pub whirlpool_program: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Rent sysvar.
+    pub rent: AccountInfo<'info>,
+    /// CHECK: Associated Token program.
+    pub associated_token_program: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClosePositionAccounts<'info> {
+    #[account(
+        seeds = [CONFIG_SEED, config.voltr_vault.as_ref()],
+        bump = config.bump,
+    )]
+    pub config: Box<Account<'info, OrcaStrategyConfig>>,
+
+    pub keeper: Signer<'info>,
+
+    /// Receives the lamports refunded from closing the Position account
+    /// and the Position NFT mint.
+    /// CHECK: Whirlpool validates nothing about this account; it's just the lamport sink.
+    #[account(mut)]
+    pub receiver: AccountInfo<'info>,
+
+    /// CHECK: Position account to close.
+    #[account(mut)]
+    pub position: AccountInfo<'info>,
+
+    /// CHECK: Position NFT mint — burned + closed.
+    #[account(mut)]
+    pub position_mint: AccountInfo<'info>,
+
+    /// CHECK: ATA holding the single NFT — burned.
+    #[account(mut)]
+    pub position_token_account: AccountInfo<'info>,
+
+    /// CHECK: Orca Whirlpool program.
+    #[account(address = whirlpool_cpi::WHIRLPOOL_PROGRAM_ID)]
+    pub whirlpool_program: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 // ===========================================================================
 // State
 // ===========================================================================
@@ -354,6 +521,20 @@ pub struct SwapEvent {
     pub whirlpool: Pubkey,
 }
 
+#[event]
+pub struct OpenPositionEvent {
+    pub whirlpool: Pubkey,
+    pub position: Pubkey,
+    pub position_mint: Pubkey,
+    pub tick_lower_index: i32,
+    pub tick_upper_index: i32,
+}
+
+#[event]
+pub struct ClosePositionEvent {
+    pub position: Pubkey,
+}
+
 // ===========================================================================
 // Errors
 // ===========================================================================
@@ -368,4 +549,6 @@ pub enum OrcaAdaptorError {
     NotKeeper,
     #[msg("Program is paused")]
     Paused,
+    #[msg("tick_lower_index must be < tick_upper_index")]
+    InvalidTickRange,
 }

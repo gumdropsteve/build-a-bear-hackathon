@@ -112,3 +112,135 @@ pub fn swap<'info>(
     )
     .map_err(Into::into)
 }
+
+/// CPI into Whirlpool's `open_position` instruction.
+///
+/// Creates a new Position account + mints a Position NFT to the owner's
+/// position_token_account. The position starts with zero liquidity — use
+/// `increase_liquidity` to deposit into it (Phase 3).
+///
+/// `position_mint` is a fresh `Keypair` generated off-chain; the client
+/// must sign the tx with it. We just forward the accounts.
+///
+/// Whirlpool signature:
+/// ```text
+/// open_position(
+///   bumps: OpenPositionBumps { position_bump: u8 },
+///   tick_lower_index: i32,
+///   tick_upper_index: i32,
+/// )
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn open_position<'info>(
+    whirlpool_program: &AccountInfo<'info>,
+    funder: &AccountInfo<'info>,
+    owner: &AccountInfo<'info>,
+    position: &AccountInfo<'info>,
+    position_mint: &AccountInfo<'info>,
+    position_token_account: &AccountInfo<'info>,
+    whirlpool: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    rent: &AccountInfo<'info>,
+    associated_token_program: &AccountInfo<'info>,
+    position_bump: u8,
+    tick_lower_index: i32,
+    tick_upper_index: i32,
+) -> Result<()> {
+    let mut data = Vec::with_capacity(8 + 1 + 4 + 4);
+    data.extend_from_slice(&anchor_disc("open_position"));
+    data.push(position_bump);
+    data.extend_from_slice(&tick_lower_index.to_le_bytes());
+    data.extend_from_slice(&tick_upper_index.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: WHIRLPOOL_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*funder.key, true),
+            AccountMeta::new_readonly(*owner.key, false),
+            AccountMeta::new(*position.key, false),
+            AccountMeta::new(*position_mint.key, true),
+            AccountMeta::new(*position_token_account.key, false),
+            AccountMeta::new_readonly(*whirlpool.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new_readonly(*system_program.key, false),
+            AccountMeta::new_readonly(*rent.key, false),
+            AccountMeta::new_readonly(*associated_token_program.key, false),
+        ],
+        data,
+    };
+
+    // No signer_seeds needed — funder and position_mint are real signers on
+    // the outer transaction.
+    anchor_lang::solana_program::program::invoke(
+        &ix,
+        &[
+            whirlpool_program.clone(),
+            funder.clone(),
+            owner.clone(),
+            position.clone(),
+            position_mint.clone(),
+            position_token_account.clone(),
+            whirlpool.clone(),
+            token_program.clone(),
+            system_program.clone(),
+            rent.clone(),
+            associated_token_program.clone(),
+        ],
+    )
+    .map_err(Into::into)
+}
+
+/// CPI into Whirlpool's `close_position` instruction.
+///
+/// Burns the Position NFT and closes the Position account. Requires the
+/// position to have 0 liquidity; any leftover fees/rewards must be
+/// collected and liquidity decreased to 0 first.
+///
+/// `position_authority` is the authority that can spend the position NFT
+/// from `position_token_account`. For our strategy that's the config PDA,
+/// which signs via `signer_seeds`.
+///
+/// Whirlpool signature:
+/// ```text
+/// close_position()
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn close_position<'info>(
+    whirlpool_program: &AccountInfo<'info>,
+    position_authority: &AccountInfo<'info>,
+    receiver: &AccountInfo<'info>,
+    position: &AccountInfo<'info>,
+    position_mint: &AccountInfo<'info>,
+    position_token_account: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let ix = Instruction {
+        program_id: WHIRLPOOL_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*position_authority.key, true),
+            AccountMeta::new(*receiver.key, false),
+            AccountMeta::new(*position.key, false),
+            AccountMeta::new(*position_mint.key, false),
+            AccountMeta::new(*position_token_account.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+        ],
+        data: anchor_disc("close_position").to_vec(),
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            whirlpool_program.clone(),
+            position_authority.clone(),
+            receiver.clone(),
+            position.clone(),
+            position_mint.clone(),
+            position_token_account.clone(),
+            token_program.clone(),
+        ],
+        signer_seeds,
+    )
+    .map_err(Into::into)
+}

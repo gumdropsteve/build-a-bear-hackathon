@@ -30,7 +30,7 @@ import { createHash } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 
-const ORCA_ADAPTOR = new PublicKey("7yiMutzu66FexVadQSzfDunWiUiPGqC5XLATZiQDyWY5");
+const ORCA_ADAPTOR = new PublicKey("2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q");
 const WHIRLPOOL_PROGRAM = new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 
 // SOL/USDC 4 bps Whirlpool (token_mint_a = SOL, token_mint_b = USDC)
