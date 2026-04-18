@@ -14,7 +14,7 @@ use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 mod whirlpool_cpi;
 
-declare_id!("2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q");
+declare_id!("5o35D7VMZpJpN9JQxuhzdGiYQofNfgXQFcuWxihFD8Lc");
 
 pub const CONFIG_SEED: &[u8] = b"orca_strategy_config";
 
@@ -270,6 +270,109 @@ pub mod orca_adaptor {
         });
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Liquidity management — Phase 3
+    // -----------------------------------------------------------------------
+
+    /// Add liquidity to an open position. `token_max_a/b` are the maximum
+    /// token amounts the caller is willing to spend; Whirlpool computes the
+    /// exact amounts needed given current price + tick range.
+    pub fn increase_liquidity(
+        ctx: Context<ModifyLiquidityAccounts>,
+        liquidity_amount: u128,
+        token_max_a: u64,
+        token_max_b: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, OrcaAdaptorError::Paused);
+        require!(liquidity_amount > 0, OrcaAdaptorError::ZeroAmount);
+        require_keys_eq!(
+            ctx.accounts.keeper.key(),
+            config.keeper,
+            OrcaAdaptorError::NotKeeper
+        );
+
+        let voltr_vault = config.voltr_vault;
+        let bump = config.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, voltr_vault.as_ref(), &[bump]]];
+
+        whirlpool_cpi::increase_liquidity(
+            &ctx.accounts.whirlpool_program,
+            &ctx.accounts.whirlpool,
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.config.to_account_info(),
+            &ctx.accounts.position,
+            &ctx.accounts.position_token_account,
+            &ctx.accounts.token_owner_account_a.to_account_info(),
+            &ctx.accounts.token_owner_account_b.to_account_info(),
+            &ctx.accounts.token_vault_a,
+            &ctx.accounts.token_vault_b,
+            &ctx.accounts.tick_array_lower,
+            &ctx.accounts.tick_array_upper,
+            liquidity_amount,
+            token_max_a,
+            token_max_b,
+            signer_seeds,
+        )?;
+
+        emit!(IncreaseLiquidityEvent {
+            position: ctx.accounts.position.key(),
+            liquidity_amount,
+            token_max_a,
+            token_max_b,
+        });
+        Ok(())
+    }
+
+    /// Remove liquidity from an open position. `token_min_a/b` are slippage
+    /// floors — Whirlpool reverts if the withdrawn amounts would be below.
+    pub fn decrease_liquidity(
+        ctx: Context<ModifyLiquidityAccounts>,
+        liquidity_amount: u128,
+        token_min_a: u64,
+        token_min_b: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, OrcaAdaptorError::Paused);
+        require!(liquidity_amount > 0, OrcaAdaptorError::ZeroAmount);
+        require_keys_eq!(
+            ctx.accounts.keeper.key(),
+            config.keeper,
+            OrcaAdaptorError::NotKeeper
+        );
+
+        let voltr_vault = config.voltr_vault;
+        let bump = config.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, voltr_vault.as_ref(), &[bump]]];
+
+        whirlpool_cpi::decrease_liquidity(
+            &ctx.accounts.whirlpool_program,
+            &ctx.accounts.whirlpool,
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.config.to_account_info(),
+            &ctx.accounts.position,
+            &ctx.accounts.position_token_account,
+            &ctx.accounts.token_owner_account_a.to_account_info(),
+            &ctx.accounts.token_owner_account_b.to_account_info(),
+            &ctx.accounts.token_vault_a,
+            &ctx.accounts.token_vault_b,
+            &ctx.accounts.tick_array_lower,
+            &ctx.accounts.tick_array_upper,
+            liquidity_amount,
+            token_min_a,
+            token_min_b,
+            signer_seeds,
+        )?;
+
+        emit!(DecreaseLiquidityEvent {
+            position: ctx.accounts.position.key(),
+            liquidity_amount,
+            token_min_a,
+            token_min_b,
+        });
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -456,6 +559,59 @@ pub struct OpenPositionAccounts<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ModifyLiquidityAccounts<'info> {
+    #[account(
+        seeds = [CONFIG_SEED, config.voltr_vault.as_ref()],
+        bump = config.bump,
+    )]
+    pub config: Box<Account<'info, OrcaStrategyConfig>>,
+
+    pub keeper: Signer<'info>,
+
+    /// CHECK: Whirlpool the position is on.
+    #[account(mut)]
+    pub whirlpool: AccountInfo<'info>,
+
+    /// CHECK: Position account.
+    #[account(mut)]
+    pub position: AccountInfo<'info>,
+
+    /// CHECK: ATA holding the position NFT (owner = config PDA); proves
+    /// we're authorized to modify the position.
+    pub position_token_account: AccountInfo<'info>,
+
+    /// Strategy's token-A ATA (source on increase, dest on decrease).
+    #[account(mut)]
+    pub token_owner_account_a: Box<Account<'info, TokenAccount>>,
+
+    /// Strategy's token-B ATA.
+    #[account(mut)]
+    pub token_owner_account_b: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Whirlpool's token-A vault.
+    #[account(mut)]
+    pub token_vault_a: AccountInfo<'info>,
+
+    /// CHECK: Whirlpool's token-B vault.
+    #[account(mut)]
+    pub token_vault_b: AccountInfo<'info>,
+
+    /// CHECK: Tick array covering the position's lower tick.
+    #[account(mut)]
+    pub tick_array_lower: AccountInfo<'info>,
+
+    /// CHECK: Tick array covering the position's upper tick.
+    #[account(mut)]
+    pub tick_array_upper: AccountInfo<'info>,
+
+    /// CHECK: Orca Whirlpool program.
+    #[account(address = whirlpool_cpi::WHIRLPOOL_PROGRAM_ID)]
+    pub whirlpool_program: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct ClosePositionAccounts<'info> {
     #[account(
         seeds = [CONFIG_SEED, config.voltr_vault.as_ref()],
@@ -533,6 +689,22 @@ pub struct OpenPositionEvent {
 #[event]
 pub struct ClosePositionEvent {
     pub position: Pubkey,
+}
+
+#[event]
+pub struct IncreaseLiquidityEvent {
+    pub position: Pubkey,
+    pub liquidity_amount: u128,
+    pub token_max_a: u64,
+    pub token_max_b: u64,
+}
+
+#[event]
+pub struct DecreaseLiquidityEvent {
+    pub position: Pubkey,
+    pub liquidity_amount: u128,
+    pub token_min_a: u64,
+    pub token_min_b: u64,
 }
 
 // ===========================================================================

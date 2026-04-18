@@ -29,7 +29,7 @@ import { createHash } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 
-const ORCA_ADAPTOR = new PublicKey("2E1dBx7rMi5qbqorRs4keRZ7P42zi5itGaGxHnSwTZ8Q");
+const ORCA_ADAPTOR = new PublicKey("5o35D7VMZpJpN9JQxuhzdGiYQofNfgXQFcuWxihFD8Lc");
 const WHIRLPOOL_PROGRAM = new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 const WHIRLPOOL = new PublicKey("4HppGTweoGQ8ZZ6UcCgwJKfi5mJD9Dqwy6htCpnbfBLW");
 const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");

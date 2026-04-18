@@ -191,6 +191,133 @@ pub fn open_position<'info>(
     .map_err(Into::into)
 }
 
+/// Shared accounts list for `increase_liquidity` and `decrease_liquidity`.
+/// Both use Whirlpool's `ModifyLiquidity` account struct.
+#[allow(clippy::too_many_arguments)]
+fn modify_liquidity_accounts<'info>(
+    whirlpool_program: &AccountInfo<'info>,
+    whirlpool: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    position_authority: &AccountInfo<'info>,
+    position: &AccountInfo<'info>,
+    position_token_account: &AccountInfo<'info>,
+    token_owner_account_a: &AccountInfo<'info>,
+    token_owner_account_b: &AccountInfo<'info>,
+    token_vault_a: &AccountInfo<'info>,
+    token_vault_b: &AccountInfo<'info>,
+    tick_array_lower: &AccountInfo<'info>,
+    tick_array_upper: &AccountInfo<'info>,
+) -> (Vec<AccountMeta>, Vec<AccountInfo<'info>>) {
+    let metas = vec![
+        AccountMeta::new(*whirlpool.key, false),
+        AccountMeta::new_readonly(*token_program.key, false),
+        AccountMeta::new_readonly(*position_authority.key, true),
+        AccountMeta::new(*position.key, false),
+        AccountMeta::new_readonly(*position_token_account.key, false),
+        AccountMeta::new(*token_owner_account_a.key, false),
+        AccountMeta::new(*token_owner_account_b.key, false),
+        AccountMeta::new(*token_vault_a.key, false),
+        AccountMeta::new(*token_vault_b.key, false),
+        AccountMeta::new(*tick_array_lower.key, false),
+        AccountMeta::new(*tick_array_upper.key, false),
+    ];
+    let infos = vec![
+        whirlpool_program.clone(),
+        whirlpool.clone(),
+        token_program.clone(),
+        position_authority.clone(),
+        position.clone(),
+        position_token_account.clone(),
+        token_owner_account_a.clone(),
+        token_owner_account_b.clone(),
+        token_vault_a.clone(),
+        token_vault_b.clone(),
+        tick_array_lower.clone(),
+        tick_array_upper.clone(),
+    ];
+    (metas, infos)
+}
+
+/// CPI into Whirlpool's `increase_liquidity` instruction.
+///
+/// Deposits `token_max_a` / `token_max_b` of the two tokens into the
+/// position for `liquidity_amount` units of concentrated liquidity.
+/// Whirlpool computes the exact tokens taken from max inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn increase_liquidity<'info>(
+    whirlpool_program: &AccountInfo<'info>,
+    whirlpool: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    position_authority: &AccountInfo<'info>,
+    position: &AccountInfo<'info>,
+    position_token_account: &AccountInfo<'info>,
+    token_owner_account_a: &AccountInfo<'info>,
+    token_owner_account_b: &AccountInfo<'info>,
+    token_vault_a: &AccountInfo<'info>,
+    token_vault_b: &AccountInfo<'info>,
+    tick_array_lower: &AccountInfo<'info>,
+    tick_array_upper: &AccountInfo<'info>,
+    liquidity_amount: u128,
+    token_max_a: u64,
+    token_max_b: u64,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let mut data = Vec::with_capacity(8 + 16 + 8 + 8);
+    data.extend_from_slice(&anchor_disc("increase_liquidity"));
+    data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    data.extend_from_slice(&token_max_a.to_le_bytes());
+    data.extend_from_slice(&token_max_b.to_le_bytes());
+
+    let (accounts, infos) = modify_liquidity_accounts(
+        whirlpool_program, whirlpool, token_program, position_authority,
+        position, position_token_account, token_owner_account_a,
+        token_owner_account_b, token_vault_a, token_vault_b,
+        tick_array_lower, tick_array_upper,
+    );
+    let ix = Instruction { program_id: WHIRLPOOL_PROGRAM_ID, accounts, data };
+    invoke_signed(&ix, &infos, signer_seeds).map_err(Into::into)
+}
+
+/// CPI into Whirlpool's `decrease_liquidity` instruction.
+///
+/// Removes `liquidity_amount` units from the position and sends the
+/// corresponding tokens back to the caller's ATAs. `token_min_a/b` are
+/// slippage floors.
+#[allow(clippy::too_many_arguments)]
+pub fn decrease_liquidity<'info>(
+    whirlpool_program: &AccountInfo<'info>,
+    whirlpool: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    position_authority: &AccountInfo<'info>,
+    position: &AccountInfo<'info>,
+    position_token_account: &AccountInfo<'info>,
+    token_owner_account_a: &AccountInfo<'info>,
+    token_owner_account_b: &AccountInfo<'info>,
+    token_vault_a: &AccountInfo<'info>,
+    token_vault_b: &AccountInfo<'info>,
+    tick_array_lower: &AccountInfo<'info>,
+    tick_array_upper: &AccountInfo<'info>,
+    liquidity_amount: u128,
+    token_min_a: u64,
+    token_min_b: u64,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let mut data = Vec::with_capacity(8 + 16 + 8 + 8);
+    data.extend_from_slice(&anchor_disc("decrease_liquidity"));
+    data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    data.extend_from_slice(&token_min_a.to_le_bytes());
+    data.extend_from_slice(&token_min_b.to_le_bytes());
+
+    let (accounts, infos) = modify_liquidity_accounts(
+        whirlpool_program, whirlpool, token_program, position_authority,
+        position, position_token_account, token_owner_account_a,
+        token_owner_account_b, token_vault_a, token_vault_b,
+        tick_array_lower, tick_array_upper,
+    );
+    let ix = Instruction { program_id: WHIRLPOOL_PROGRAM_ID, accounts, data };
+    invoke_signed(&ix, &infos, signer_seeds).map_err(Into::into)
+}
+
 /// CPI into Whirlpool's `close_position` instruction.
 ///
 /// Burns the Position NFT and closes the Position account. Requires the
