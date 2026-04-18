@@ -18,6 +18,34 @@ declare_id!("5o35D7VMZpJpN9JQxuhzdGiYQofNfgXQFcuWxihFD8Lc");
 
 pub const CONFIG_SEED: &[u8] = b"orca_strategy_config";
 
+/// Shared L-2/L-5 check for the modify-liquidity ixs: the passed Whirlpool
+/// vaults + strategy ATA mints must match the Whirlpool's stored state.
+fn validate_modify_liquidity_pool(accounts: &ModifyLiquidityAccounts) -> Result<()> {
+    let wp = whirlpool_cpi::parse_whirlpool(&accounts.whirlpool)
+        .ok_or(OrcaAdaptorError::InvalidWhirlpool)?;
+    require_keys_eq!(
+        wp.token_vault_a,
+        accounts.token_vault_a.key(),
+        OrcaAdaptorError::WhirlpoolVaultMismatch
+    );
+    require_keys_eq!(
+        wp.token_vault_b,
+        accounts.token_vault_b.key(),
+        OrcaAdaptorError::WhirlpoolVaultMismatch
+    );
+    require_keys_eq!(
+        wp.token_mint_a,
+        accounts.token_owner_account_a.mint,
+        OrcaAdaptorError::TokenMintMismatch
+    );
+    require_keys_eq!(
+        wp.token_mint_b,
+        accounts.token_owner_account_b.mint,
+        OrcaAdaptorError::TokenMintMismatch
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Program
 // ---------------------------------------------------------------------------
@@ -39,6 +67,21 @@ pub mod orca_adaptor {
         config.asset_mint = args.asset_mint;
         config.bump = ctx.bumps.config;
         config.paused = false;
+        config.min_swap_out_bps = 0;
+        Ok(())
+    }
+
+    /// Rotate the admin. Admin only. No timelock — for extra safety pair
+    /// this with off-chain multisig / SQDS on the admin key.
+    pub fn set_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.config.admin,
+            OrcaAdaptorError::NotAdmin
+        );
+        let old = ctx.accounts.config.admin;
+        ctx.accounts.config.admin = new_admin;
+        emit!(AdminSetEvent { old, new: new_admin });
         Ok(())
     }
 
@@ -49,7 +92,9 @@ pub mod orca_adaptor {
             ctx.accounts.config.admin,
             OrcaAdaptorError::NotAdmin
         );
+        let old = ctx.accounts.config.keeper;
         ctx.accounts.config.keeper = new_keeper;
+        emit!(KeeperSetEvent { old, new: new_keeper });
         Ok(())
     }
 
@@ -61,6 +106,21 @@ pub mod orca_adaptor {
             OrcaAdaptorError::NotAdmin
         );
         ctx.accounts.config.paused = paused;
+        emit!(PausedSetEvent { paused });
+        Ok(())
+    }
+
+    /// Set `min_swap_out_bps` — the minimum out/in ratio enforced on swap
+    /// for pegged-pair pools. 0 disables the check. Max 10_000 (100%).
+    pub fn set_swap_params(ctx: Context<AdminOnly>, min_swap_out_bps: u16) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.config.admin,
+            OrcaAdaptorError::NotAdmin
+        );
+        require!(min_swap_out_bps <= 10_000, OrcaAdaptorError::InvalidSlippage);
+        ctx.accounts.config.min_swap_out_bps = min_swap_out_bps;
+        emit!(SwapParamsSetEvent { min_swap_out_bps });
         Ok(())
     }
 
@@ -68,8 +128,25 @@ pub mod orca_adaptor {
     // Voltr CPI handlers
     // -----------------------------------------------------------------------
 
-    /// Called by Voltr's `initialize_strategy` CPI.
-    pub fn initialize(_ctx: Context<VoltrInitialize>, _voltr_vault: Pubkey) -> Result<()> {
+    /// Called by Voltr's `initialize_strategy` CPI. Validates that the
+    /// `strategy` account Voltr is about to register matches this adaptor's
+    /// config PDA for the given vault — otherwise Voltr could wire up a
+    /// receipt pointing at an uninitialized account.
+    pub fn initialize(ctx: Context<VoltrInitialize>, voltr_vault: Pubkey) -> Result<()> {
+        let (expected_config, _) = Pubkey::find_program_address(
+            &[CONFIG_SEED, voltr_vault.as_ref()],
+            &crate::ID,
+        );
+        require_keys_eq!(
+            ctx.accounts.strategy.key(),
+            expected_config,
+            OrcaAdaptorError::InvalidStrategyPda
+        );
+        require_keys_eq!(
+            ctx.accounts.vault.key(),
+            voltr_vault,
+            OrcaAdaptorError::InvalidVoltrVault
+        );
         msg!("orca_adaptor strategy registered with Voltr");
         Ok(())
     }
@@ -143,10 +220,49 @@ pub mod orca_adaptor {
         let config = &ctx.accounts.config;
         require!(!config.paused, OrcaAdaptorError::Paused);
         require!(amount_in > 0, OrcaAdaptorError::ZeroAmount);
+        // M-1: require a non-trivial slippage floor. A compromised keeper
+        // passing `min_amount_out = 0` with extreme sqrt_price_limit would
+        // otherwise accept any fill Whirlpool can produce (sandwich bait).
+        require!(min_amount_out > 0, OrcaAdaptorError::NoSlippageFloor);
+        // Optional stricter floor for pegged pairs (admin-set).
+        if config.min_swap_out_bps > 0 {
+            let required = (amount_in as u128)
+                .checked_mul(config.min_swap_out_bps as u128)
+                .ok_or(OrcaAdaptorError::MathOverflow)?
+                .checked_div(10_000)
+                .ok_or(OrcaAdaptorError::MathOverflow)? as u64;
+            require!(min_amount_out >= required, OrcaAdaptorError::SwapOutBelowFloor);
+        }
         require_keys_eq!(
             ctx.accounts.keeper.key(),
             config.keeper,
             OrcaAdaptorError::NotKeeper
+        );
+
+        // L-2 + L-5: validate the Whirlpool's advertised token mints and
+        // vaults match what the caller passed. Prevents a keeper routing
+        // through the wrong pool (MEV vector) or a pool it controls.
+        let wp = whirlpool_cpi::parse_whirlpool(&ctx.accounts.whirlpool)
+            .ok_or(OrcaAdaptorError::InvalidWhirlpool)?;
+        require_keys_eq!(
+            wp.token_vault_a,
+            ctx.accounts.whirlpool_vault_a.key(),
+            OrcaAdaptorError::WhirlpoolVaultMismatch
+        );
+        require_keys_eq!(
+            wp.token_vault_b,
+            ctx.accounts.whirlpool_vault_b.key(),
+            OrcaAdaptorError::WhirlpoolVaultMismatch
+        );
+        require_keys_eq!(
+            wp.token_mint_a,
+            ctx.accounts.strategy_token_a_ata.mint,
+            OrcaAdaptorError::TokenMintMismatch
+        );
+        require_keys_eq!(
+            wp.token_mint_b,
+            ctx.accounts.strategy_token_b_ata.mint,
+            OrcaAdaptorError::TokenMintMismatch
         );
 
         let voltr_vault = config.voltr_vault;
@@ -209,6 +325,19 @@ pub mod orca_adaptor {
         require!(
             tick_lower_index < tick_upper_index,
             OrcaAdaptorError::InvalidTickRange
+        );
+
+        // I-4: enforce tick-spacing alignment early with a clear error.
+        let wp = whirlpool_cpi::parse_whirlpool(&ctx.accounts.whirlpool)
+            .ok_or(OrcaAdaptorError::InvalidWhirlpool)?;
+        let spacing = wp.tick_spacing as i32;
+        require!(
+            tick_lower_index.rem_euclid(spacing) == 0,
+            OrcaAdaptorError::InvalidTickAlignment
+        );
+        require!(
+            tick_upper_index.rem_euclid(spacing) == 0,
+            OrcaAdaptorError::InvalidTickAlignment
         );
 
         whirlpool_cpi::open_position(
@@ -292,6 +421,7 @@ pub mod orca_adaptor {
             config.keeper,
             OrcaAdaptorError::NotKeeper
         );
+        validate_modify_liquidity_pool(&ctx.accounts)?;
 
         let voltr_vault = config.voltr_vault;
         let bump = config.bump;
@@ -341,6 +471,7 @@ pub mod orca_adaptor {
             config.keeper,
             OrcaAdaptorError::NotKeeper
         );
+        validate_modify_liquidity_pool(&ctx.accounts)?;
 
         let voltr_vault = config.voltr_vault;
         let bump = config.bump;
@@ -471,12 +602,12 @@ pub struct SwapAccounts<'info> {
 
     pub keeper: Signer<'info>,
 
-    /// Strategy's token-A ATA (owner = config PDA).
-    #[account(mut)]
+    /// Strategy's token-A ATA (owner = config PDA). L-1: ownership enforced.
+    #[account(mut, constraint = strategy_token_a_ata.owner == config.key() @ OrcaAdaptorError::StrategyAtaOwnerMismatch)]
     pub strategy_token_a_ata: Box<Account<'info, TokenAccount>>,
 
-    /// Strategy's token-B ATA (owner = config PDA).
-    #[account(mut)]
+    /// Strategy's token-B ATA (owner = config PDA). L-1: ownership enforced.
+    #[account(mut, constraint = strategy_token_b_ata.owner == config.key() @ OrcaAdaptorError::StrategyAtaOwnerMismatch)]
     pub strategy_token_b_ata: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Whirlpool account.
@@ -581,11 +712,12 @@ pub struct ModifyLiquidityAccounts<'info> {
     pub position_token_account: AccountInfo<'info>,
 
     /// Strategy's token-A ATA (source on increase, dest on decrease).
-    #[account(mut)]
+    /// L-1: ownership enforced.
+    #[account(mut, constraint = token_owner_account_a.owner == config.key() @ OrcaAdaptorError::StrategyAtaOwnerMismatch)]
     pub token_owner_account_a: Box<Account<'info, TokenAccount>>,
 
-    /// Strategy's token-B ATA.
-    #[account(mut)]
+    /// Strategy's token-B ATA. L-1: ownership enforced.
+    #[account(mut, constraint = token_owner_account_b.owner == config.key() @ OrcaAdaptorError::StrategyAtaOwnerMismatch)]
     pub token_owner_account_b: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Whirlpool's token-A vault.
@@ -622,9 +754,10 @@ pub struct ClosePositionAccounts<'info> {
     pub keeper: Signer<'info>,
 
     /// Receives the lamports refunded from closing the Position account
-    /// and the Position NFT mint.
-    /// CHECK: Whirlpool validates nothing about this account; it's just the lamport sink.
-    #[account(mut)]
+    /// and the Position NFT mint. L-4: forced to be the admin so a
+    /// compromised keeper can't redirect rent.
+    /// CHECK: address-constrained to config.admin.
+    #[account(mut, address = config.admin @ OrcaAdaptorError::InvalidReceiver)]
     pub receiver: AccountInfo<'info>,
 
     /// CHECK: Position account to close.
@@ -658,11 +791,17 @@ pub struct OrcaStrategyConfig {
     pub asset_mint: Pubkey,
     pub bump: u8,
     pub paused: bool,
-    pub _reserved: [u8; 62],
+    /// Minimum `min_amount_out / amount_in` ratio enforced on `swap`, in bps.
+    /// 0 = off (admin accepts keeper's floor as-is). 9000 = "min_amount_out
+    /// must be >= 90% of amount_in in base units". Only meaningful for
+    /// pegged pairs where in/out are comparable 1:1; set 0 for cross-asset
+    /// pools (e.g. SOL/USDC) and rely on the keeper's `min_amount_out`.
+    pub min_swap_out_bps: u16,
+    pub _reserved: [u8; 60],
 }
 
 impl OrcaStrategyConfig {
-    pub const LEN: usize = 32 + 32 + 32 + 32 + 1 + 1 + 62;
+    pub const LEN: usize = 32 + 32 + 32 + 32 + 1 + 1 + 2 + 60;
 }
 
 // ===========================================================================
@@ -707,6 +846,28 @@ pub struct DecreaseLiquidityEvent {
     pub token_min_b: u64,
 }
 
+#[event]
+pub struct AdminSetEvent {
+    pub old: Pubkey,
+    pub new: Pubkey,
+}
+
+#[event]
+pub struct KeeperSetEvent {
+    pub old: Pubkey,
+    pub new: Pubkey,
+}
+
+#[event]
+pub struct PausedSetEvent {
+    pub paused: bool,
+}
+
+#[event]
+pub struct SwapParamsSetEvent {
+    pub min_swap_out_bps: u16,
+}
+
 // ===========================================================================
 // Errors
 // ===========================================================================
@@ -723,4 +884,28 @@ pub enum OrcaAdaptorError {
     Paused,
     #[msg("tick_lower_index must be < tick_upper_index")]
     InvalidTickRange,
+    #[msg("Tick index is not a multiple of the pool's tick_spacing")]
+    InvalidTickAlignment,
+    #[msg("min_amount_out must be greater than zero (no slippage floor)")]
+    NoSlippageFloor,
+    #[msg("Provided min_amount_out is below the config's min_swap_out_bps floor")]
+    SwapOutBelowFloor,
+    #[msg("Math overflow")]
+    MathOverflow,
+    #[msg("Invalid slippage parameter (must be <= 10000 bps)")]
+    InvalidSlippage,
+    #[msg("Whirlpool account data could not be parsed")]
+    InvalidWhirlpool,
+    #[msg("Whirlpool vault does not match the Whirlpool's stored vault")]
+    WhirlpoolVaultMismatch,
+    #[msg("Token mint of a passed ATA does not match the Whirlpool's token")]
+    TokenMintMismatch,
+    #[msg("Strategy ATA is not owned by the config PDA")]
+    StrategyAtaOwnerMismatch,
+    #[msg("Receiver must be the admin")]
+    InvalidReceiver,
+    #[msg("Strategy PDA does not match the voltr_vault seed")]
+    InvalidStrategyPda,
+    #[msg("voltr_vault arg does not match the passed vault account")]
+    InvalidVoltrVault,
 }

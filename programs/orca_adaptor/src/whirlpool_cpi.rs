@@ -28,6 +28,45 @@ fn anchor_disc(name: &str) -> [u8; 8] {
     out
 }
 
+/// Extract of a Whirlpool account's packed fields we use for CPI input
+/// validation. Layout (byte offsets from start of data):
+///   0..8    — Anchor discriminator
+///   8..40   — whirlpools_config
+///   40      — bump
+///   41..43  — tick_spacing (u16 LE)
+///   81..85  — tick_current_index (i32 LE)
+///   101..133 — token_mint_a
+///   133..165 — token_vault_a
+///   181..213 — token_mint_b
+///   213..245 — token_vault_b
+///
+/// Source: github.com/orca-so/whirlpools/blob/main/programs/whirlpool/src/state/whirlpool.rs
+pub struct WhirlpoolView {
+    pub tick_spacing: u16,
+    pub tick_current_index: i32,
+    pub token_mint_a: Pubkey,
+    pub token_vault_a: Pubkey,
+    pub token_mint_b: Pubkey,
+    pub token_vault_b: Pubkey,
+}
+
+/// Parse the fields of a Whirlpool account we need for input validation.
+/// Returns `None` if the account is too small to be a valid Whirlpool.
+pub fn parse_whirlpool(whirlpool: &AccountInfo) -> Option<WhirlpoolView> {
+    let data = whirlpool.try_borrow_data().ok()?;
+    if data.len() < 245 {
+        return None;
+    }
+    Some(WhirlpoolView {
+        tick_spacing: u16::from_le_bytes(data[41..43].try_into().ok()?),
+        tick_current_index: i32::from_le_bytes(data[81..85].try_into().ok()?),
+        token_mint_a: Pubkey::try_from(&data[101..133]).ok()?,
+        token_vault_a: Pubkey::try_from(&data[133..165]).ok()?,
+        token_mint_b: Pubkey::try_from(&data[181..213]).ok()?,
+        token_vault_b: Pubkey::try_from(&data[213..245]).ok()?,
+    })
+}
+
 /// CPI into Whirlpool's `swap` instruction.
 ///
 /// Parameters per Whirlpool's on-chain signature:
