@@ -2,6 +2,7 @@
 members = [
     "programs/musdx",
     "programs/lev_musdx_adaptor",
+    "programs/orca_adaptor",
 ]
 resolver = "2"
 
